@@ -9,10 +9,9 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 const FLOW_LABEL = { none: '无 AI', first: 'AI 先介入', later: 'AI 后介入' };
-const VIDEO_LABEL = { empty: '待上传视频', processing: '处理中', ready: '标准视频就绪', failed: '处理失败' };
+const VIDEO_LABEL = { empty: '未上传', processing: '处理中', ready: '已就绪', failed: '处理失败' };
 const TASK_LABEL = { not_started: '未开始', in_progress: '进行中', submitted: '已提交' };
 const AI_LABEL = { locked: '待初稿', waiting: '等待视频', generating: '生成中', ready: '已生成', failed: '失败' };
-const roundLabel = (round) => `第 ${round.id} 轮 · ${esc(round.name)}`;
 
 const state = {
   me: null,
@@ -78,18 +77,17 @@ function openModal(title, bodyHtml, actions = []) {
     : '';
   $('#modalRoot').innerHTML = `
     <div class="modal-backdrop">
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
-        <div class="modal-header"><h2 id="dialogTitle">${esc(title)}</h2><button class="icon-btn" type="button" data-modal-close aria-label="关闭弹窗">${icons('close')}</button></div>
+      <section class="modal" role="dialog" aria-modal="true">
+        <div class="modal-header"><h2>${esc(title)}</h2><button class="icon-btn" type="button" data-modal-close aria-label="关闭">${icons('close')}</button></div>
         <div class="modal-body">${bodyHtml}</div>
         ${footer}
       </section>
     </div>`;
-  const backdrop = $('#modalRoot .modal-backdrop');
-  backdrop.querySelector('[data-modal-close]').addEventListener('click', closeModal);
-  backdrop.addEventListener('click', (e) => {
-    if (e.target === backdrop) closeModal();
+  $('#modalRoot').querySelector('[data-modal-close]').addEventListener('click', closeModal);
+  $('#modalRoot').querySelector('.modal-backdrop').addEventListener('click', (e) => {
+    if (e.target.classList.contains('modal-backdrop')) closeModal();
   });
-  backdrop.querySelectorAll('[data-modal-action]').forEach((btn) => {
+  $('#modalRoot').querySelectorAll('[data-modal-action]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const action = state.modalActions[Number(btn.dataset.modalAction)];
       if (!action) return;
@@ -97,10 +95,10 @@ function openModal(title, bodyHtml, actions = []) {
         btn.disabled = true;
         try { await action.onClick(); } finally { btn.disabled = false; }
       }
-      if (backdrop.isConnected) closeModal();
+      closeModal();
     });
   });
-  backdrop.querySelector('button')?.focus();
+  setTimeout(() => $('#modalRoot button')?.focus(), 0);
 }
 
 function closeModal() {

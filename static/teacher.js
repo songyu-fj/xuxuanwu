@@ -8,7 +8,7 @@ Object.assign(state, {
   filters: { class_id: '', round_id: '' },
   anonymous: false,
   surveyMeta: null,
-  dataRequest: 0,
+  taskStats: [],
 });
 
 /* ------------------------------------------------------------ 登录 */
@@ -66,6 +66,7 @@ function renderTeacherLogin() {
 }
 
 function showTeacherLogin() {
+  state.taskStats = [];
   renderTeacherLogin();
 }
 
@@ -85,7 +86,7 @@ function teacherNavItems() {
 function renderTeacherNav() {
   const active = state.view;
   $('#navigation').innerHTML = teacherNavItems().map(([key, icon, label]) => `
-    <button type="button" data-view="${key}" title="${label}" class="${active === key ? 'active' : ''}" ${active === key ? 'aria-current="page"' : ''}>
+    <button type="button" data-view="${key}" class="${active === key ? 'active' : ''}" ${active === key ? 'aria-current="page"' : ''}>
       ${icons(icon)}<span>${label}</span>
     </button>`).join('');
   $$('#navigation [data-view]').forEach((btn) => {
@@ -118,38 +119,38 @@ async function renderConfig() {
   $('#main').innerHTML = '<div class="empty">加载中…</div>';
   try {
     const data = await api('/api/teacher/config');
-    if (state.view !== 'config') return;
     const settings = data.settings || {};
     const settingRow = (key, title, desc, checked) => `
       <div class="setting-row">
         <div><strong>${title}</strong><div class="settings-desc">${desc}</div></div>
-        <label class="switch"><input type="checkbox" aria-label="${title}" data-setting="${key}" ${checked ? 'checked' : ''}><span></span></label>
+        <label class="switch"><input type="checkbox" data-setting="${key}" ${checked ? 'checked' : ''}><span></span></label>
       </div>`;
     const settingsCard = `
-      <section class="card settings-card experiment-settings">
+      <section class="card settings-card" style="margin-bottom:22px">
         <h3>实验流程与问卷</h3>
         ${settingRow('fixed_sequence', '固定任务顺序', '课堂练习提交后才能进入课后反思', settings.fixed_sequence)}
         ${settingRow('survey_pre', '启用实验前问卷', '学生进入任务前必须完成，未完成时任务锁定', settings.survey_pre)}
         ${settingRow('survey_post', '启用实验后问卷', '两个任务都提交后开放填写', settings.survey_post)}
       </section>`;
     const roundsHtml = data.rounds.map((round) => `
-      <section class="round-config" aria-labelledby="round-title-${round.id}">
+      <section class="round-config">
         <div class="section-heading">
-          <h2 id="round-title-${round.id}">${roundLabel(round)}</h2>
+          <h2>${esc(round.name)}</h2>
+          <span class="tag">配置作用于之后新建的任务</span>
         </div>
         <div class="group-grid">
-          ${data.classes.map((c, index) => {
+          ${data.classes.map((c) => {
             const cfg = data.configs[`${c.id}:${round.id}`] || { flow: 'none', scaffold: false };
             return `<section class="card group-card">
-              <div class="group-letter">${String.fromCharCode(65 + index)}</div>
+              <div class="row between"><div class="group-letter">${c.id}</div><span class="tag">${esc(c.name)}</span></div>
               <div class="config-name">${esc(c.name)}</div>
               <label for="flow-${c.id}-${round.id}">AI 介入流程</label>
               <select class="field" id="flow-${c.id}-${round.id}" data-flow="${c.id}-${round.id}">
-                ${Object.entries(FLOW_LABEL).map(([k, v]) => `<option value="${k}" ${cfg.flow === k ? 'selected' : ''}>${k === 'none' ? '无 AI 介入' : v}</option>`).join('')}
+                ${Object.entries(FLOW_LABEL).map(([k, v]) => `<option value="${k}" ${cfg.flow === k ? 'selected' : ''}>${v}</option>`).join('')}
               </select>
               <div class="switch-row">
                 <span>显示三阶段支架</span>
-                <label class="switch"><input type="checkbox" aria-label="${esc(round.name)} ${esc(c.name)}反思支架" data-scaffold="${c.id}-${round.id}" ${cfg.scaffold ? 'checked' : ''}><span></span></label>
+                <label class="switch"><input type="checkbox" data-scaffold="${c.id}-${round.id}" ${cfg.scaffold ? 'checked' : ''}><span></span></label>
               </div>
               <p class="config-note">${cfg.flow === 'first' ? '视频就绪后开放 AI 反馈' : cfg.flow === 'later' ? '提交初稿后才显示 AI 建议' : '关闭 AI 调用与反馈面板'}</p>
             </section>`;
@@ -160,17 +161,17 @@ async function renderConfig() {
       <div class="page-head">
         <div>
           <div class="eyebrow">EXPERIMENT DESIGN</div>
-          <h1>把 AI 的介入，放在合适的时刻。</h1>
-          <p>分别设置课堂练习与课后反思中，各班级的 AI 介入流程和反思支架。</p>
+          <h1>实验配置</h1>
+          <p>设置各班级的 AI 介入流程、反思支架，以及实验流程与前后测问卷。</p>
         </div>
         <button class="btn primary" type="button" id="saveConfigBtn">${icons('save', 'i-sm')} 保存实验配置</button>
       </div>
-      <div class="notice">${icons('info')}<span>两轮分别保存班级配置；已经开始的任务沿用创建时的配置。</span></div>
-      ${roundsHtml}
-      ${settingsCard}`;
+      <div class="notice" style="margin-bottom:18px">班级配置只影响之后新建的任务；已经开始的任务沿用创建时的配置。流程与问卷设置即时作用于学生端。</div>
+      ${settingsCard}
+      ${roundsHtml}`;
     $('#saveConfigBtn').addEventListener('click', saveConfig);
   } catch (ex) {
-    if (state.view === 'config') $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
+    $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
   }
 }
 
@@ -198,21 +199,25 @@ function renderData() {
     <div class="page-head">
       <div>
         <div class="eyebrow">RESEARCH DATA</div>
-        <h1>看见反思，也看见它发生的过程。</h1>
-        <p>以任务 ID 关联实验条件、正文版本、AI 反馈与行为事件。</p>
+        <h1>过程数据</h1>
+        <p>按班级和任务查看提交情况、文本版本、AI 反馈、行为事件与问卷。</p>
       </div>
-      <button class="btn primary" id="exportDataBtn" type="button">${icons('download', 'i-sm')} 导出研究数据</button>
+      <div class="export-row">
+        <label class="anon-label"><input type="checkbox" id="anonExport" ${state.anonymous ? 'checked' : ''}> 匿名导出</label>
+        <a class="btn" id="participantsLink" href="#">参与者名单</a>
+        <a class="btn" id="exportLink" href="#">导出当前数据</a>
+      </div>
     </div>
-    <div class="source-line">CSV 可按任务 ID 与被试编号关联。导出时可选择匿名格式。</div>
-    <div class="data-inline" id="dataStats"></div>
+    <div class="source-line">被试编号用于匿名分析；数据保存在本机 SQLite。CSV 可按 task_id / participant_id 关联。</div>
+    <div class="data-inline four" id="dataStats"></div>
     <div class="filters">
-      <select class="field" id="filterClass" aria-label="筛选班级">
+      <select class="field" id="filterClass">
         <option value="">全部班级</option>
         ${state.meta.classes.map((c) => `<option value="${c.id}" ${String(state.filters.class_id) === String(c.id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
       </select>
-      <select class="field" id="filterRound" aria-label="筛选任务轮次">
-        <option value="">全部轮次</option>
-        ${state.meta.rounds.map((r) => `<option value="${r.id}" ${String(state.filters.round_id) === String(r.id) ? 'selected' : ''}>${roundLabel(r)}</option>`).join('')}
+      <select class="field" id="filterRound">
+        <option value="">全部任务</option>
+        ${state.meta.rounds.map((r) => `<option value="${r.id}" ${String(state.filters.round_id) === String(r.id) ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}
       </select>
       <button class="btn small" type="button" id="refreshData">刷新</button>
     </div>
@@ -224,7 +229,7 @@ function renderData() {
   $('#filterClass').addEventListener('change', (e) => { state.filters.class_id = e.target.value; loadData(); });
   $('#filterRound').addEventListener('change', (e) => { state.filters.round_id = e.target.value; loadData(); });
   $('#refreshData').addEventListener('click', loadData);
-  $('#exportDataBtn').addEventListener('click', openDataExport);
+  $('#anonExport').addEventListener('change', (e) => { state.anonymous = e.target.checked; updateExportLinks(); });
   $$('[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.dataTab = btn.dataset.tab;
@@ -251,55 +256,50 @@ function exportHref(type, includeRound = true) {
   return `/api/teacher/export?type=${type}${qs ? `&${qs}` : ''}`;
 }
 
-function openDataExport() {
-  const options = [
-    ['tasks', '任务记录'], ['versions', '文本版本'], ['feedback', 'AI 反馈'],
-    ['events', '行为事件'], ['surveys', '问卷'], ['participants', '参与者名单'],
-  ];
-  openModal('导出研究数据', `
-    <label class="anon-label"><input type="checkbox" id="anonExport" ${state.anonymous ? 'checked' : ''}> 匿名导出</label>
-    <div class="export-row">
-      ${options.map(([type, label]) => `<a class="btn ${type === state.dataTab ? 'primary' : ''}" data-export="${type}" href="${esc(exportHref(type, type !== 'participants'))}" download>${icons('download', 'i-sm')} ${label}</a>`).join('')}
-    </div>`, [{ label: '关闭' }]);
-  $('#anonExport').addEventListener('change', (event) => {
-    state.anonymous = event.target.checked;
-    $$('[data-export]').forEach((link) => {
-      link.href = exportHref(link.dataset.export, link.dataset.export !== 'participants');
-    });
-  });
+function updateExportLinks() {
+  const exportLink = $('#exportLink');
+  if (exportLink) exportLink.href = exportHref(state.dataTab);
+  const participantsLink = $('#participantsLink');
+  if (participantsLink) participantsLink.href = exportHref('participants', false);
 }
 
 async function loadData() {
+  updateExportLinks();
   const box = $('#dataContent');
   if (!box) return;
-  const request = ++state.dataRequest;
-  const tab = state.dataTab;
   box.innerHTML = '<div class="empty">加载中…</div>';
   const qs = dataQuery();
-  const query = qs ? `?${qs}` : '';
   try {
-    const taskRequest = api(`/api/teacher/monitor/tasks${query}`);
-    const [taskData, data] = await Promise.all([
-      taskRequest, tab === 'tasks' ? taskRequest : api(`/api/teacher/monitor/${tab}${query}`),
-    ]);
-    if (request !== state.dataRequest || !box.isConnected) return;
-    state.surveyMeta = data.items ? { items: data.items, scale: data.scale } : null;
-    renderStats(taskData.rows || []);
-    box.innerHTML = renderDataTable(tab, data.rows || []);
+    const taskData = await api(`/api/teacher/monitor/tasks${qs ? `?${qs}` : ''}`);
+    state.taskStats = taskData.rows || [];
+    let rows = state.taskStats;
+    if (state.dataTab !== 'tasks') {
+      const data = await api(`/api/teacher/monitor/${state.dataTab}${qs ? `?${qs}` : ''}`);
+      rows = data.rows || [];
+      state.surveyMeta = data.items ? { items: data.items, scale: data.scale } : null;
+    } else {
+      state.surveyMeta = null;
+    }
+    renderStats();
+    box.innerHTML = renderDataTable(state.dataTab, rows);
   } catch (ex) {
-    if (request === state.dataRequest) box.innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
+    box.innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
   }
 }
 
-function renderStats(rows) {
+function renderStats() {
+  const rows = state.taskStats || [];
   const submitted = rows.filter((r) => r.status === 'submitted').length;
   const doing = rows.filter((r) => r.status === 'in_progress').length;
   const idle = rows.filter((r) => r.status === 'not_started').length;
-  const deviations = rows.filter((r) => r.order_deviation).length;
-  $('#dataStats').innerHTML = `
-    <div class="card stat"><span>已开始任务</span><strong>${submitted + doing}</strong><small>${doing} 进行中 · ${idle} 未开始</small></div>
-    <div class="card stat"><span>已提交最终稿</span><strong>${submitted}</strong><small>每个任务保留一份最终稿</small></div>
-    <div class="card stat"><span>顺序偏离任务</span><strong>${deviations}</strong><small>按当前筛选统计</small></div>`;
+  const students = new Set(rows.map((r) => r.student_no)).size;
+  const box = $('#dataStats');
+  if (!box) return;
+  box.innerHTML = `
+    <div class="card stat"><span>参与学生</span><strong>${students}</strong><small>已登录学生</small></div>
+    <div class="card stat"><span>已提交</span><strong>${submitted}</strong><small>任务实例</small></div>
+    <div class="card stat"><span>进行中</span><strong>${doing}</strong><small>尚未提交</small></div>
+    <div class="card stat"><span>未开始</span><strong>${idle}</strong><small>尚未进入任务</small></div>`;
 }
 
 function preview(text, time) {
