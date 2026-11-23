@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log
+
+# 本地实验数据与视频，不进入代码仓库
+data/app.db
+data/app.db-*
+data/secret.key
+data/videos/
+data/raw/
+
+# 演示截图
+demo/

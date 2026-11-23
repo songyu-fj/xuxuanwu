@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="微课视频反思实验系统 · 教师端">
+<title>映思 · 教师端</title>
+<link rel="stylesheet" href="/static/style.css?v=20261123c">
+</head>
+<body data-role="teacher">
+<svg style="display:none" aria-hidden="true"><defs>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+<symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="2"/><path d="m16 9 5-3v12l-5-3"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="m15 4 5 5M4 20l5-1L21 7a2 2 0 0 0-5-5L4 14Z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 16v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5ZM20 2v4m-2-2h4"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+<symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+<symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+<symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 11a9 9 0 1 1 3 8M3 4v7h7"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="currentColor"/><circle cx="15" cy="12" r="2" fill="currentColor"/><circle cx="8" cy="18" r="2" fill="currentColor"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 3v18h17M8 16v-5m5 5V7m5 9v-8"/></symbol>
+<symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 3C9 2 3 6 5 14c4 7 14 6 15-11ZM4 21 15 10"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M12 5c-3-2-7-2-10-1v15c4-1 7-1 10 1 3-2 6-2 10-1V4c-3-1-7-1-10 1Zm0 0v15"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+</defs></svg>
+
+<div id="loginRoot"></div>
+
+<div id="appRoot" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><svg class="icon i-lg"><use href="#i-video"/></svg></div>
+      <div><div class="brand-name">映思</div><div class="brand-sub">REFLECT &amp; GROW</div></div>
+    </div>
+    <div class="nav-label" id="navLabel">研究管理</div>
+    <nav class="nav" id="navigation" aria-label="主导航"></nav>
+    <div class="side-note">
+      <div class="leaf"><svg class="icon"><use href="#i-leaf"/></svg></div>
+      <h3>让数据，回到课堂的证据</h3>
+      <p>查看实验条件、文本版本，<br>以及每一次操作发生的顺序。</p>
+    </div>
+    <div class="side-bottom"><span>教师端</span><span>v1.0</span></div>
+  </aside>
+  <div class="app">
+    <header class="topbar">
+      <div class="row">
+        <button class="icon-btn mobile-menu" id="mobileNavBtn" aria-label="打开导航">
+          <svg class="icon"><use href="#i-menu"/></svg>
+        </button>
+        <div class="breadcrumb">
+          <span id="crumbSpace">研究管理</span>
+          <svg class="icon i-sm"><use href="#i-chevron"/></svg>
+          <strong id="crumbPage">实验配置</strong>
+          <span class="role-badge teacher">教师端</span>
+        </div>
+      </div>
+      <div class="top-right">
+        <div class="profile">
+          <div class="avatar" id="avatar">研</div>
+          <div id="profileText">研究人员<small class="profile-code">实验管理员</small></div>
+          <button class="btn ghost tiny logout-btn" id="logoutBtn" type="button">退出</button>
+        </div>
+      </div>
+    </header>
+    <main class="main" id="main"></main>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/static/shared.js?v=20261123c"></script>
+<script src="/static/teacher.js?v=20261123c"></script>
+</body>
+</html>
