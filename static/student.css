@@ -1,0 +1,76 @@
+.prototype-bar[hidden] {
+  display: none;
+}
+
+.prototype-bar .prototype-separator {
+  color: #c7bda6;
+}
+
+.prototype-bar select:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.prototype-bar .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.topbar #studentProfile {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.player-time {
+  gap: 6px;
+}
+
+.player-options {
+  gap: 5px;
+}
+
+.video-stage .play-big {
+  z-index: 3;
+}
+
+.video-stage.playing .play-big:focus-visible {
+  opacity: 1;
+}
+
+.video-stage.playing .play-big .icon {
+  fill: none;
+  stroke-width: 2;
+  margin-left: 0;
+}
+
+.controls :disabled {
+  cursor: default;
+}
+
+.editor-label label {
+  font-weight: 550;
+}
+
+.editor-actions .row {
+  gap: 7px;
+}
+
+.time-link .icon {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+}
+
+@media (max-width: 980px) {
+  .topbar #studentProfile #profileText {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .topbar #studentProfile {
+    display: none;
+  }
+}
