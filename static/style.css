@@ -120,3 +120,14 @@
   .video-actions{flex-wrap:wrap}
 }
 
+.prototype-bar[hidden]{display:none}
+.prototype-bar .round-class{border-left:1px solid #ded7c5;padding-left:7px}
+.player-time{gap:6px}
+.player-options{gap:5px}
+.video-stage .play-big{z-index:3}
+.video-stage.playing .play-big:focus-visible{opacity:1}
+.video-stage.playing .play-big .icon{fill:none;stroke-width:2;margin-left:0}
+.controls :disabled{cursor:default}
+.experiment-settings{margin-top:30px}
+#modalRoot .export-row{margin-top:12px}
+
