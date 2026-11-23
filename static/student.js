@@ -20,6 +20,7 @@ Object.assign(state, {
   saveTimer: null,
   saveChain: Promise.resolve(),
   pollTimer: null,
+  presentingAi: null,
   uploadingRounds: new Set(),
   surveyKind: 'pre',
   surveyData: null,
@@ -359,11 +360,12 @@ function renderWorkspace() {
     <div class="workspace-grid">
       <div>
         <section class="card video-card" id="videoCard">${videoCardHtml()}</section>
-        <div id="aiArea">${task.flow === 'none' ? '' : aiCardHtml()}</div>
+        <div id="aiArea">${aiCardHtml()}</div>
       </div>
       <div>
         <section class="card reflection-card" id="reflectionCard">${reflectionCardHtml()}</section>
         <div class="submit-note" id="submitHint">${icons('lock', 'i-sm')} ${submitHint()}</div>
+        <div id="taskFinalFeedback"></div>
       </div>
     </div>`;
   bindVideo();
@@ -371,6 +373,7 @@ function renderWorkspace() {
   bindReflection();
   updateDeviationBanner();
   markAiPresented();
+  updateWorkspaceFeedback(task);
   schedulePollIfNeeded();
 }
 
@@ -412,7 +415,7 @@ function videoCardHtml() {
     stage = `<video id="videoEl" src="${src}" preload="metadata" playsinline></video>
       <button class="play-big" type="button" id="bigPlay" aria-label="播放视频">${icons('play')}</button>`;
   } else if (vs === 'processing') {
-    stage = `<div class="video-placeholder">${icons('reset', 'i-lg spin')}<div>正在统一转码为 720p MP4，请稍候</div><div class="small">处理期间可以先撰写反思</div></div>`;
+    stage = `<div class="video-placeholder">${icons('reset', 'i-lg spin')}<div>正在统一转码为 720p MP4，请稍候</div><div class="small">${task.flow === 'first' ? 'AI 建议呈现后可开始撰写反思' : '处理期间可以先撰写反思'}</div></div>`;
   } else if (vs === 'failed') {
     stage = `<div class="video-placeholder"><div class="big">!</div><div>视频处理失败</div>
       <div class="small">反思草稿不受影响，可重试转码或重新上传</div>
@@ -456,24 +459,25 @@ function videoCardHtml() {
 
 function aiCardHtml() {
   const task = state.task;
+  if (task.flow === 'none' || (task.flow === 'later' && task.status === 'submitted')) return '';
   const ai = task.ai;
   let body = '';
-  if (task.flow === 'later' && !task.initial) {
+  if (task.flow === 'later') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('lock')}</div>
-      <h3>先留下你的观察，再听听 AI 的建议</h3>
-      <p>填写反思后，点击「保存初稿并查看 AI 反馈」。<br>你的初稿将单独保留，之后仍可继续修改正文。</p></div>`;
+      <h3>先完成反思，再查看建议</h3>
+      <p>先独立撰写各阶段的反思。<br>提交最终稿后生成改进建议。</p></div>`;
   } else if (ai.status === 'waiting') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('clock')}</div>
       <h3>视频就绪后，AI 将先提供观察与建议</h3>
-      <p>请选择微课视频并完成处理。等待期间，你仍可播放已就绪的视频和编辑反思。</p></div>`;
+      <p>请上传微课视频。AI 建议呈现后即可开始撰写反思。</p></div>`;
   } else if (ai.status === 'generating') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('reset', 'spin')}</div>
       <h3>正在生成视频观察与建议</h3>
-      <p>请稍候，你可以继续播放视频和编辑反思。反馈就绪后将在这里自动展开。</p></div>`;
+      <p>等待期间，你可以播放视频。建议呈现后会开放反思编辑。</p></div>`;
   } else if (ai.status === 'failed') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('info')}</div>
       <h3>AI 分析暂时失败</h3>
-      <p>你的反思仍可继续编辑。重试会沿用本次视频${task.initial ? '与已确认初稿' : ''}。</p>
+      <p>请重试，建议就绪后即可编辑反思。已有草稿会保留。</p>
       <button class="btn tiny ai-retry" type="button" id="aiRetryBtn">${icons('reset', 'i-sm')} 重试分析</button></div>`;
   } else if (ai.status === 'ready') {
     body = `<div id="feedbackBody">${ai.items.map((item) => `
@@ -491,7 +495,7 @@ function aiCardHtml() {
     <section class="card ai-card">
       <div class="panel-head">
         <h2><span class="ai-symbol">${icons('spark', 'i-sm')}</span> AI 观察与建议</h2>
-        <span class="tag ${ai.status === 'ready' ? 'green' : ''}">${{ ready: '演示反馈', generating: '正在分析', failed: '分析失败', waiting: task.flow === 'later' && !task.initial ? '待初稿确认' : '等待视频', locked: '待初稿确认' }[ai.status] || ''}</span>
+        <span class="tag ${ai.status === 'ready' ? 'green' : ''}">${task.flow === 'later' ? '待最终稿提交' : { ready: '演示反馈', generating: '正在分析', failed: '分析失败', waiting: '等待视频' }[ai.status] || ''}</span>
       </div>
       ${body}
       <div class="ai-bottom">${icons('info', 'i-sm')} 反馈仅供参考，请依据视频形成自己的判断。</div>
@@ -519,6 +523,7 @@ function scaffoldHtml() {
 function reflectionCardHtml() {
   const task = state.task;
   const submitted = task.status === 'submitted';
+  const locked = submitted || awaitingFirstFeedback(task);
   const current = task.stages[state.stage] || '';
   return `
     ${submitted ? `<div class="submitted-banner">${icons('check', 'i-sm')} 已于 ${fmtClock(task.submitted_at)} 提交，本轮反思已完成。</div>` : ''}
@@ -531,20 +536,41 @@ function reflectionCardHtml() {
       <label id="reflectionLabel" for="reflection">${state.stage}反思内容</label>
     </div>
     <div class="editor-wrap">
-      <textarea id="reflection" class="reflection" ${submitted ? 'readonly' : ''}
-        placeholder="${task.scaffold ? '可结合片头、片中、片尾，记录你的观察、判断与改进想法。' : '记录你认为值得反思的观察、依据或改进想法。'}">${esc(current)}</textarea>
+      <textarea id="reflection" class="reflection" ${locked ? 'readonly' : ''}
+        placeholder="${reflectionPlaceholder(task)}">${esc(current)}</textarea>
       <div class="editor-tools">
         <span id="wordCount">${words(current)} 字</span>
         <span id="saveStatus" class="save-state" role="status">${saveStatusHtml()}</span>
       </div>
     </div>
     <div class="editor-actions">
-      <button class="btn ghost" type="button" data-act="timestamp" ${submitted ? 'disabled' : ''}>${icons('clock', 'i-sm')} 插入当前时间点</button>
+      <button class="btn ghost" type="button" data-act="timestamp" ${locked ? 'disabled' : ''}>${icons('clock', 'i-sm')} 插入当前时间点</button>
       <div class="row">
-        <button class="btn" type="button" data-act="save" ${submitted ? 'disabled' : ''}>保存草稿</button>
+        <button class="btn" type="button" data-act="save" ${locked ? 'disabled' : ''}>保存草稿</button>
         <button class="btn primary" id="primaryBtn" type="button" data-act="primary" title="${submitHint()}" ${primaryDisabled() ? 'disabled' : ''}>${primaryLabel()}</button>
       </div>
     </div>`;
+}
+
+function awaitingFirstFeedback(task) {
+  return task.flow === 'first' && (task.ai.status !== 'ready' || !task.ai.presented_at);
+}
+
+function reflectionPlaceholder(task) {
+  if (task.status !== 'submitted' && awaitingFirstFeedback(task)) return 'AI 建议呈现后可开始撰写反思。';
+  return task.scaffold
+    ? '可结合片头、片中、片尾，记录你的观察、判断与改进想法。'
+    : '记录你认为值得反思的观察、依据或改进想法。';
+}
+
+function updateReflectionState(task) {
+  const input = $('#reflection');
+  const locked = task.status === 'submitted' || awaitingFirstFeedback(task);
+  input.readOnly = locked;
+  input.placeholder = reflectionPlaceholder(task);
+  $('[data-act="timestamp"]').disabled = locked;
+  $('[data-act="save"]').disabled = locked;
+  updatePrimaryState();
 }
 
 function saveStatusHtml() {
@@ -553,25 +579,22 @@ function saveStatusHtml() {
 }
 
 function primaryLabel() {
-  const task = state.task;
-  if (task.status === 'submitted') return '查看最终稿';
-  if (task.flow === 'later' && !task.initial) return '保存初稿并查看 AI 反馈';
-  return '提交最终稿';
+  return state.task.status === 'submitted' ? '查看最终稿' : '提交最终稿';
 }
 function primaryDisabled() {
   const task = state.task;
   if (task.status === 'submitted') return false;
   if (task.video_status !== 'ready') return true;
-  if (task.flow !== 'none' && task.ai.status === 'generating') return true;
+  if (awaitingFirstFeedback(task)) return true;
   return !STAGES.some((s) => (task.stages[s] || '').trim());
 }
 function submitHint() {
   const task = state.task;
   if (task.status === 'submitted') return '本轮任务已提交';
   if (task.video_status !== 'ready') return '请等待标准视频就绪';
+  if (awaitingFirstFeedback(task)) return '请等待 AI 建议首次呈现';
   if (!STAGES.some((stage) => task.stages[stage]?.trim())) return '请先填写反思正文';
-  if (task.flow === 'later' && !task.initial) return '请先确认初稿并查看 AI 反馈';
-  if (task.flow !== 'none' && task.ai.status === 'generating') return '请等待 AI 反馈首次呈现';
+  if (task.flow === 'later') return '提交后保存最终稿并生成一条改进建议';
   return '提交后保存最终稿快照并结束本轮任务';
 }
 
@@ -580,7 +603,7 @@ function bindVideo() {
   if (uploadBtn) {
     uploadBtn.addEventListener('click', () => {
       openStudentModal('准备你的微课视频', `
-        <p>上传后统一处理为标准视频，视频播放、时间点和 AI 分析将使用同一素材。处理期间你可以继续编辑反思。</p>
+        <p>上传后统一处理为标准视频，供回看片段和插入时间点。${state.task.flow === 'first' ? 'AI 建议呈现后可开始撰写反思。' : '处理期间你可以编辑反思。'}</p>
         <div class="upload-zone">
           ${icons('upload')}
           <button class="btn" id="chooseVideoBtn" type="button">选择本地视频</button>
@@ -686,14 +709,11 @@ function bindReflection() {
   const input = $('#reflection');
   if (!input) return;
   input.addEventListener('input', () => {
+    if (input.readOnly) return;
     const text = input.value;
     state.task.stages[state.stage] = text;
     $('#wordCount').textContent = `${words(text)} 字`;
     $('#saveStatus').textContent = '正在保存…';
-    if (text.trim() && state.task.flow === 'first' && !state.task.ai.presented_at) {
-      state.task.order_deviation = true;
-      updateDeviationBanner();
-    }
     updatePrimaryState();
     clearTimeout(state.saveTimer);
     state.saveTimer = setTimeout(() => saveReflection(text), 900);
@@ -827,15 +847,72 @@ function showFinalSnapshot(task) {
 }
 
 function showSubmissionSuccess(task) {
+  if (state.view !== 'workspace' || state.task !== task) return;
   openStudentModal('本轮反思已提交', `
     <div class="success-content">
       <div class="success-symbol">${icons('check', 'i-lg')}</div>
       <h3>让今天的发现，走向下一次课堂。</h3>
-      <p>你的最终反思已保存。<br>本轮的正文版本与过程记录可在研究端查看。</p>
-    </div>`, [
+      <p>你的最终反思已保存。</p>
+    </div>
+    <div id="submissionFinalFeedback"></div>`, [
     { label: '查看最终稿', onClick: () => { setTimeout(() => showFinalSnapshot(task), 0); } },
     { label: '完成', primary: true },
   ]);
+  updateWorkspaceFeedback(task);
+}
+
+function mountFinalFeedback(container, record, onUpdate) {
+  if (!container) return;
+  if (record.flow !== 'later' || !record.final) { container.innerHTML = ''; return; }
+  const feedback = record.final_feedback;
+  let content;
+  if (feedback?.status === 'ready') {
+    content = `<p class="suggestion-text">${esc(feedback.suggestion)}</p>
+      <small>${feedback.model === '本地规则' ? '本地规则建议' : 'AI 生成 · 仅供参考'}</small>`;
+  } else if (feedback?.status === 'generating') {
+    content = '<p role="status">正在根据最终稿生成一条改进建议…</p>';
+  } else {
+    content = feedback
+      ? '<p role="status">建议暂时未能生成。最终稿已保存。</p><button class="btn tiny" type="button">重试生成</button>'
+      : '<button class="btn tiny" type="button">根据最终稿生成建议</button>';
+  }
+  container.innerHTML = `
+    <section class="card final-feedback">
+      <h3>${icons('spark', 'i-sm')} 最终稿反馈建议</h3>
+      ${content}
+    </section>`;
+  container.querySelector('button')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      record.final_feedback = await api(`/api/student/task/${record.round_id}/final-feedback`, { method: 'POST' });
+      onUpdate();
+    } catch (ex) {
+      button.disabled = false;
+      toast(ex.message);
+    }
+  });
+  if (feedback?.status === 'ready' && !feedback.presented_at) {
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.target.isConnected) { observer.disconnect(); return; }
+      if (!entry.isIntersecting) return;
+      observer.disconnect();
+      api(`/api/student/task/${record.round_id}/final-feedback/present`, { method: 'POST' })
+        .then(() => { feedback.presented_at = new Date().toISOString(); })
+        .catch(() => {});
+    });
+    observer.observe(container.querySelector('.final-feedback'));
+  }
+}
+
+function updateWorkspaceFeedback(task) {
+  const onUpdate = () => {
+    if (state.view !== 'workspace' || state.task !== task) return;
+    updateWorkspaceFeedback(task);
+    schedulePollIfNeeded();
+  };
+  mountFinalFeedback($('#taskFinalFeedback'), task, onUpdate);
+  mountFinalFeedback($('#submissionFinalFeedback'), task, onUpdate);
 }
 
 async function primaryAction() {
@@ -843,28 +920,12 @@ async function primaryAction() {
   if (task.status === 'submitted') { showFinalSnapshot(task); return; }
   flushSave();
   await state.saveChain.catch(() => {});
-  if (state.view !== 'workspace' || state.task !== task) return;
-  if (task.flow === 'later' && !task.initial) {
-    openStudentModal('确认初稿，查看 AI 反馈', `
-      <p>当前正文将固定为你的<strong>已确认初稿</strong>，用于保留接触 AI 反馈前的教学判断。确认后，你仍可继续编辑正文。</p>
-      <div class="snapshot">${esc(taskContent(task.stages))}</div>
-      <div class="snapshot-meta">${STAGES.reduce((count, stage) => count + words(task.stages[stage]), 0)} 字 · 初稿只确认一次</div>`,
-      [
-        { label: '继续修改' },
-        {
-          label: '确认初稿并生成反馈', primary: true, onClick: async () => {
-            try {
-              await api(`/api/student/task/${task.round_id}/initial`, { method: 'POST' });
-              await refreshTask();
-              toast('初稿已提交，AI 反馈生成中');
-            } catch (ex) { toast(ex.message); }
-          },
-        },
-      ]);
-    return;
-  }
+  if (state.view !== 'workspace' || state.task !== task || primaryDisabled()) return;
+  const message = task.flow === 'later'
+    ? '提交后将保存最终稿并结束本轮任务，随后根据正文生成一条改进建议。'
+    : '提交后将保存最终稿并结束本轮任务。';
   openStudentModal('提交本轮最终反思', `
-    <p>提交后将保存最终稿快照，并结束本轮任务。请确认观察、依据与改进想法已记录完整。</p>
+    <p>${message}请确认反思内容已记录完整。</p>
     <div class="snapshot">${esc(taskContent(task.stages))}</div>
     <div class="snapshot-meta">${STAGES.reduce((count, stage) => count + words(task.stages[stage]), 0)} 字 · 任务 ${task.id}</div>`,
     [
@@ -891,22 +952,24 @@ async function refreshTask(reloadVideo = false) {
     const task = await api(`/api/student/task/${previous.round_id}`);
     if (state.view !== 'workspace' || state.task !== previous) return;
     const statusChanged = previous.status !== task.status;
+    const feedbackChanged = previous.final_feedback?.status !== task.final_feedback?.status;
     const videoChanged = reloadVideo || previous.video_status !== task.video_status
       || previous.video_name !== task.video_name;
-    const aiChanged = previous.ai.status !== task.ai.status || Boolean(previous.initial) !== Boolean(task.initial) || videoChanged;
+    const aiChanged = previous.ai.status !== task.ai.status || videoChanged;
     if (task.status !== 'submitted') {
       task.stages = previous.stages;
       task.stage_meta = previous.stage_meta;
       task.order_deviation ||= previous.order_deviation;
     }
+    if (task.ai.status === 'ready') task.ai.presented_at ||= previous.ai.presented_at;
     Object.assign(previous, task);
     if (videoChanged) {
       $('#videoEl')?.pause();
       $('#videoCard').innerHTML = videoCardHtml();
       bindVideo();
     }
-    if (aiChanged) {
-      $('#aiArea').innerHTML = task.flow === 'none' ? '' : aiCardHtml();
+    if (aiChanged || statusChanged) {
+      $('#aiArea').innerHTML = aiCardHtml();
       bindAi();
     }
     if (statusChanged) {
@@ -918,23 +981,29 @@ async function refreshTask(reloadVideo = false) {
       $('#videoMeta').textContent = '本轮已提交，视频锁定';
       renderWorkspaceRoundBar();
     }
+    if (statusChanged || feedbackChanged) updateWorkspaceFeedback(previous);
     updateDeviationBanner();
-    updatePrimaryState();
+    updateReflectionState(previous);
     markAiPresented();
-    schedulePollIfNeeded();
   } catch (ex) { /* 轮询期间忽略短暂错误 */ }
+  finally {
+    if (state.view === 'workspace' && state.task === previous) schedulePollIfNeeded();
+  }
 }
 
 function schedulePollIfNeeded() {
   stopPolling();
   const task = state.task;
   if (!task) return;
-  const need = task.video_status === 'processing' || task.ai.status === 'generating';
+  const need = task.video_status === 'processing' || task.ai.status === 'generating'
+    || (task.flow === 'first' && task.status !== 'submitted' && task.video_status === 'ready'
+      && (task.ai.status === 'waiting' || (task.ai.status === 'ready' && !task.ai.presented_at)))
+    || task.final_feedback?.status === 'generating';
   if (!need) return;
   state.pollTimer = setTimeout(async () => {
-    const prevAi = state.task.ai.status;
+    const prevAi = task.ai.status;
     await refreshTask();
-    if (state.task && prevAi !== 'ready' && state.task.ai.status === 'ready') {
+    if (state.task === task && prevAi !== 'ready' && task.ai.status === 'ready') {
       toast('AI 观察与建议已生成');
     }
   }, 1800);
@@ -947,11 +1016,17 @@ function stopPolling() {
 
 async function markAiPresented() {
   const task = state.task;
-  if (!task || !$('#feedbackBody') || task.ai.status !== 'ready' || task.ai.presented_at) return;
+  if (!task || task.flow !== 'first' || !$('#feedbackBody') || task.ai.status !== 'ready'
+    || task.ai.presented_at || state.presentingAi === task) return;
+  state.presentingAi = task;
   try {
-    await api(`/api/student/task/${state.roundId}/ai/present`, { method: 'POST' });
-    task.ai.presented_at = new Date().toISOString();
+    const result = await api(`/api/student/task/${task.round_id}/ai/present`, { method: 'POST' });
+    task.ai.presented_at = result.presented_at;
+    if (state.view === 'workspace' && state.task === task) updateReflectionState(task);
   } catch (ex) { /* 忽略 */ }
+  finally {
+    if (state.presentingAi === task) state.presentingAi = null;
+  }
 }
 
 function logEvent(type, detail = '', position = null, roundId = state.task?.round_id) {
@@ -1028,6 +1103,7 @@ async function renderRecords() {
     const data = await api('/api/student/records');
     if (state.view !== 'records') return;
     const showRound = (roundId) => {
+      stopPolling();
       const record = data.records.find((item) => item.round_id === roundId);
       if (!record) return;
       state.roundId = roundId;
@@ -1037,7 +1113,9 @@ async function renderRecords() {
           <h1>反思记录</h1>
           ${record.initial ? '<button class="btn" type="button" id="viewInitial">查看已确认初稿</button>' : ''}
         </div>
-        <div class="reflection-archive">${STAGES.map((stage) => recordStageHtml(record, stage)).join('')}</div>`;
+        <div class="reflection-archive">${STAGES.map((stage) => recordStageHtml(record, stage)).join('')}</div>
+        <div id="recordFinalFeedback"></div>`;
+      updateRecordFeedback(record, $('#recordFinalFeedback'));
       $('#viewInitial')?.addEventListener('click', () => {
         openStudentModal('已确认初稿', `
           <p>确认于 ${fmtTime(record.initial.time)}</p>
@@ -1048,6 +1126,20 @@ async function renderRecords() {
   } catch (ex) {
     if (state.view === 'records') $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
   }
+}
+
+function updateRecordFeedback(record, container) {
+  if (!container.isConnected) return;
+  const update = () => updateRecordFeedback(record, container);
+  mountFinalFeedback(container, record, update);
+  if (record.final_feedback?.status !== 'generating') return;
+  state.pollTimer = setTimeout(async () => {
+    try {
+      const data = await api('/api/student/records');
+      record.final_feedback = data.records.find((item) => item.round_id === record.round_id)?.final_feedback;
+    } catch (ex) { /* 轮询期间忽略短暂错误 */ }
+    update();
+  }, 1800);
 }
 
 function recordStageHtml(record, stage) {

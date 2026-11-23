@@ -152,7 +152,7 @@ async function renderConfig() {
                 <span>显示三阶段支架</span>
                 <label class="switch"><input type="checkbox" data-scaffold="${c.id}-${round.id}" ${cfg.scaffold ? 'checked' : ''}><span></span></label>
               </div>
-              <p class="config-note">${cfg.flow === 'first' ? '视频就绪后开放 AI 反馈' : cfg.flow === 'later' ? '提交初稿后才显示 AI 建议' : '关闭 AI 调用与反馈面板'}</p>
+              <p class="config-note">${cfg.flow === 'first' ? '先呈现 AI 建议，再开放反思' : cfg.flow === 'later' ? '提交最终稿后生成 AI 建议' : '不生成 AI 建议'}</p>
             </section>`;
           }).join('')}
         </div>
@@ -205,7 +205,8 @@ function renderData() {
       <div class="export-row">
         <label class="anon-label"><input type="checkbox" id="anonExport" ${state.anonymous ? 'checked' : ''}> 匿名导出</label>
         <a class="btn" id="participantsLink" href="#">参与者名单</a>
-        <a class="btn" id="exportLink" href="#">导出当前数据</a>
+        <a class="btn" id="surveysLink" href="#">问卷 CSV</a>
+        <button class="btn primary" type="button" id="exportDataBtn">${icons('download', 'i-sm')} 导出研究数据</button>
       </div>
     </div>
     <div class="source-line">被试编号用于匿名分析；数据保存在本机 SQLite。CSV 可按 task_id / participant_id 关联。</div>
@@ -230,6 +231,7 @@ function renderData() {
   $('#filterRound').addEventListener('change', (e) => { state.filters.round_id = e.target.value; loadData(); });
   $('#refreshData').addEventListener('click', loadData);
   $('#anonExport').addEventListener('change', (e) => { state.anonymous = e.target.checked; updateExportLinks(); });
+  $('#exportDataBtn').addEventListener('click', openResearchExport);
   $$('[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.dataTab = btn.dataset.tab;
@@ -247,20 +249,51 @@ function dataQuery() {
   return params.toString();
 }
 
-function exportHref(type, includeRound = true) {
+function exportHref(type, includeRound = true, localNames = false) {
   const params = new URLSearchParams();
   if (state.filters.class_id) params.set('class_id', state.filters.class_id);
   if (includeRound && state.filters.round_id) params.set('round_id', state.filters.round_id);
   if (state.anonymous) params.set('anonymous', '1');
+  if (localNames) params.set('names', 'zh');
   const qs = params.toString();
   return `/api/teacher/export?type=${type}${qs ? `&${qs}` : ''}`;
 }
 
 function updateExportLinks() {
-  const exportLink = $('#exportLink');
-  if (exportLink) exportLink.href = exportHref(state.dataTab);
+  const surveysLink = $('#surveysLink');
+  if (surveysLink) surveysLink.href = exportHref('surveys', false);
   const participantsLink = $('#participantsLink');
   if (participantsLink) participantsLink.href = exportHref('participants', false);
+}
+
+async function openResearchExport() {
+  const files = [
+    ['tasks', '任务记录.csv', '实验条件、视频与配置'],
+    ['versions', '文本版本.csv', '草稿、初稿与最终稿原文'],
+    ['feedback', 'AI 反馈.csv', '生成与首次呈现时间'],
+    ['events', '行为事件.csv', '事件顺序、时间与视频位置'],
+  ];
+  const query = dataQuery();
+  openModal('导出研究数据', `
+    <p><span id="exportTaskCount" aria-live="polite">正在统计任务实例。</span> 分表 CSV 均为 UTF-8 编码，可按 task_id 关联。请选择下列文件逐个下载。</p>
+    <div class="scenario-options">
+      ${files.map(([type, name, description]) => `
+        <a class="scenario" href="${esc(exportHref(type, true, true))}" download>
+          <strong>${icons('download', 'i-sm')} ${name}</strong><small>${description}</small>
+        </a>`).join('')}
+    </div>
+    <div class="review-note">文件按当前班级和任务筛选导出。${state.anonymous ? '已启用匿名导出。' : '需要移除身份列时，可启用匿名导出。'}</div>`);
+  const modal = $('#modalRoot .modal');
+  modal.classList.add('wide', 'research-export');
+  modal.setAttribute('aria-label', '导出研究数据');
+  const count = modal.querySelector('#exportTaskCount');
+  try {
+    const data = await api(`/api/teacher/monitor/tasks${query ? `?${query}` : ''}`);
+    const taskIds = new Set(data.rows.map((row) => row.task_id).filter((id) => id != null));
+    count.textContent = `共 ${taskIds.size} 个任务实例。`;
+  } catch (ex) {
+    count.textContent = '暂时无法统计任务数量。';
+  }
 }
 
 async function loadData() {
@@ -348,12 +381,13 @@ function renderDataTable(tab, rows) {
   }
   if (tab === 'feedback') {
     return `<div class="card table-card"><table class="table">
-      <thead><tr><th>编号</th><th>学生</th><th>班级</th><th>任务</th><th>状态</th><th>模型</th><th>请求时间</th><th>生成时间</th><th>首次呈现</th><th>内容</th><th>下载</th></tr></thead>
+      <thead><tr><th>编号</th><th>学生</th><th>班级</th><th>任务</th><th>反馈阶段</th><th>状态</th><th>模型</th><th>请求时间</th><th>生成时间</th><th>首次呈现</th><th>内容</th><th>下载</th></tr></thead>
       <tbody>${rows.map((r) => `<tr>
         <td><strong>${esc(r.participant_id || '—')}</strong></td>
         <td>${esc(r.student_name)}</td>
         <td>${esc(r.class_name)}</td>
         <td>${esc(r.round_name)}</td>
+        <td>${esc(r.kind || '实验过程')}</td>
         <td><span class="tag ${r.status === 'ready' ? 'green' : ''}">${AI_LABEL[r.status] || r.status}</span></td>
         <td>${esc(r.model || '—')} / ${esc(r.prompt_version || '—')}</td>
         <td>${fmtTime(r.requested_at)}</td>
