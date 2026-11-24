@@ -119,19 +119,6 @@ async function renderConfig() {
   $('#main').innerHTML = '<div class="empty">加载中…</div>';
   try {
     const data = await api('/api/teacher/config');
-    const settings = data.settings || {};
-    const settingRow = (key, title, desc, checked) => `
-      <div class="setting-row">
-        <div><strong>${title}</strong><div class="settings-desc">${desc}</div></div>
-        <label class="switch"><input type="checkbox" data-setting="${key}" ${checked ? 'checked' : ''}><span></span></label>
-      </div>`;
-    const settingsCard = `
-      <section class="card settings-card" style="margin-bottom:22px">
-        <h3>实验流程与问卷</h3>
-        ${settingRow('fixed_sequence', '固定任务顺序', '课堂练习提交后才能进入课后反思', settings.fixed_sequence)}
-        ${settingRow('survey_pre', '启用实验前问卷', '学生进入任务前必须完成，未完成时任务锁定', settings.survey_pre)}
-        ${settingRow('survey_post', '启用实验后问卷', '两个任务都提交后开放填写', settings.survey_post)}
-      </section>`;
     const roundsHtml = data.rounds.map((round) => `
       <section class="round-config">
         <div class="section-heading">
@@ -162,12 +149,11 @@ async function renderConfig() {
         <div>
           <div class="eyebrow">EXPERIMENT DESIGN</div>
           <h1>实验配置</h1>
-          <p>设置各班级的 AI 介入流程、反思支架，以及实验流程与前后测问卷。</p>
+          <p>设置各班级的 AI 介入流程和反思支架。</p>
         </div>
         <button class="btn primary" type="button" id="saveConfigBtn">${icons('save', 'i-sm')} 保存实验配置</button>
       </div>
-      <div class="notice" style="margin-bottom:18px">班级配置只影响之后新建的任务；已经开始的任务沿用创建时的配置。流程与问卷设置即时作用于学生端。</div>
-      ${settingsCard}
+      <div class="notice" style="margin-bottom:18px">班级配置只影响之后新建的任务；已经开始的任务沿用创建时的配置。</div>
       ${roundsHtml}`;
     $('#saveConfigBtn').addEventListener('click', saveConfig);
   } catch (ex) {
@@ -182,10 +168,8 @@ async function saveConfig() {
     const toggle = document.querySelector(`[data-scaffold="${sel.dataset.flow}"]`);
     configs.push({ class_id: classId, round_id: roundId, flow: sel.value, scaffold: toggle && toggle.checked });
   });
-  const settings = {};
-  $$('[data-setting]').forEach((input) => { settings[input.dataset.setting] = input.checked; });
   try {
-    await api('/api/teacher/config', { method: 'PUT', body: { configs, settings } });
+    await api('/api/teacher/config', { method: 'PUT', body: { configs } });
     toast('实验配置已保存');
   } catch (ex) {
     toast(ex.message);

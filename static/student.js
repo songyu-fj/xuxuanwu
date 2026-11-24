@@ -24,6 +24,8 @@ Object.assign(state, {
   uploadingRounds: new Set(),
   surveyKind: 'pre',
   surveyData: null,
+  typing: {},
+  lastReflectionLength: 0,
 });
 
 /* ------------------------------------------------------------ 登录 */
@@ -650,9 +652,15 @@ function bindVideo() {
     seek.value = video.currentTime;
     timeDisplay.innerHTML = `${fmtDur(video.currentTime)} <span>/ ${fmtDur(duration)}</span>`;
   };
+  const report = (type, detail) => logEvent(type, detail, video.currentTime, roundId);
   const togglePlayback = () => {
-    if (video.paused) video.play().catch(() => toast('视频暂时无法播放'));
-    else video.pause();
+    if (video.paused) {
+      report('播放');
+      video.play().catch(() => toast('视频暂时无法播放'));
+    } else {
+      report('暂停');
+      video.pause();
+    }
   };
   play.addEventListener('click', togglePlayback);
   bigPlay.addEventListener('click', togglePlayback);
@@ -661,8 +669,17 @@ function bindVideo() {
     video.addEventListener(event, syncPosition);
   }
   for (const event of ['play', 'pause', 'ended']) video.addEventListener(event, syncPlayback);
+  let seekStart = null;
+  seek.addEventListener('pointerdown', () => { seekStart = video.currentTime; });
   seek.addEventListener('input', () => {
+    if (seekStart === null) seekStart = video.currentTime;
     if (Number.isFinite(video.duration)) video.currentTime = Number(seek.value);
+  });
+  seek.addEventListener('change', () => {
+    const to = Number(seek.value);
+    const from = seekStart ?? video.currentTime;
+    report('调整进度条', `从 ${fmtDur(from)} 到 ${fmtDur(to)}`);
+    seekStart = null;
   });
   volume.addEventListener('click', () => {
     video.muted = !video.muted;
@@ -679,10 +696,6 @@ function bindVideo() {
       else toast('当前浏览器不支持全屏播放');
     } catch (ex) { toast('当前浏览器无法进入全屏'); }
   });
-  const report = (type, detail) => logEvent(type, detail, video.currentTime, roundId);
-  video.addEventListener('play', () => report('播放'));
-  video.addEventListener('pause', () => report('暂停'));
-  video.addEventListener('seeked', () => report('视频跳转', `定位至 ${fmtDur(video.currentTime)}`));
 }
 
 function bindAi() {
@@ -700,18 +713,51 @@ function bindAi() {
       const video = $('#videoEl');
       if (!video) { toast('视频就绪后可跳转'); return; }
       video.currentTime = Number(btn.dataset.seek) || 0;
+      logEvent('调整进度条', `定位至 ${fmtDur(video.currentTime)}`, video.currentTime);
       video.play().catch(() => {});
     });
   });
 }
 
+function currentVideoPosition() {
+  const video = $('#videoEl');
+  return video && Number.isFinite(video.currentTime) ? video.currentTime : null;
+}
+
+function flushTyping(stage = state.stage) {
+  const stats = state.typing[stage];
+  if (!stats) return;
+  clearTimeout(stats.timer);
+  stats.timer = null;
+  if (!stats.added && !stats.removed) return;
+  const parts = [];
+  if (stats.added) parts.push(`输入 ${stats.added} 字`);
+  if (stats.removed) parts.push(`删除 ${stats.removed} 字`);
+  const text = state.task?.stages?.[stage] || '';
+  logEvent('内容编辑', `${stage}：${parts.join('，')}；当前 ${words(text)} 字`, currentVideoPosition());
+  stats.added = 0;
+  stats.removed = 0;
+}
+
 function bindReflection() {
   const input = $('#reflection');
   if (!input) return;
+  state.lastReflectionLength = input.value.length;
   input.addEventListener('input', () => {
     if (input.readOnly) return;
     const text = input.value;
-    state.task.stages[state.stage] = text;
+    const stage = state.stage;
+    const previousLength = state.lastReflectionLength ?? text.length;
+    const delta = text.length - previousLength;
+    state.lastReflectionLength = text.length;
+    state.task.stages[stage] = text;
+    if (delta !== 0) {
+      const stats = state.typing[stage] || (state.typing[stage] = { added: 0, removed: 0, timer: null });
+      if (delta > 0) stats.added += delta;
+      else stats.removed += -delta;
+      clearTimeout(stats.timer);
+      stats.timer = setTimeout(() => flushTyping(stage), 1200);
+    }
     $('#wordCount').textContent = `${words(text)} 字`;
     $('#saveStatus').textContent = '正在保存…';
     updatePrimaryState();
@@ -768,6 +814,7 @@ function flushSave() {
 
 function switchStage(stage) {
   if (stage === state.stage) return;
+  flushTyping(state.stage);
   flushSave();
   state.stage = stage;
   $$('[data-stage]').forEach((btn) => {
@@ -781,12 +828,13 @@ function switchStage(stage) {
   $('#wordCount').textContent = `${words(text)} 字`;
   $('#saveStatus').innerHTML = saveStatusHtml();
   $('#reflectionLabel').textContent = `${stage}反思内容`;
-  logEvent('切换反思阶段', stage);
+  state.lastReflectionLength = text.length;
 }
 
 async function saveDraft(manual) {
   const task = state.task;
   const stage = state.stage;
+  flushTyping(stage);
   flushSave();
   try {
     await state.saveChain;
@@ -918,6 +966,7 @@ function updateWorkspaceFeedback(task) {
 async function primaryAction() {
   const task = state.task;
   if (task.status === 'submitted') { showFinalSnapshot(task); return; }
+  flushTyping(state.stage);
   flushSave();
   await state.saveChain.catch(() => {});
   if (state.view !== 'workspace' || state.task !== task || primaryDisabled()) return;

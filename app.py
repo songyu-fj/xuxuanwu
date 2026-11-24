@@ -36,6 +36,8 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 STAGES = ["片头", "片中", "片尾"]
 ROUNDS = {1: "课堂练习", 2: "课后反思"}
+BEHAVIOR_EVENT_TYPES = ("播放", "暂停", "调整进度条", "内容编辑")
+BEHAVIOR_EVENT_SQL = "('播放','暂停','调整进度条','内容编辑')"
 FLOWS = {"none": "无 AI", "first": "AI 先介入", "later": "AI 后介入"}
 VIDEO_STATUS = {"empty": "未上传", "processing": "处理中", "ready": "已就绪", "failed": "处理失败"}
 AI_STATUS = {"locked": "待初稿", "waiting": "等待视频", "generating": "生成中", "ready": "已生成", "failed": "失败"}
@@ -289,6 +291,8 @@ def tasks_submitted(conn, user_id):
 
 
 def log_event(conn, task_id, type_, detail="", position=None):
+    if type_ not in BEHAVIOR_EVENT_TYPES:
+        return
     seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE task_id=?", (task_id,)).fetchone()[0]
     conn.execute(
         "INSERT INTO events(task_id,seq,type,detail,position,occurred_at) VALUES(?,?,?,?,?,?)",
@@ -1452,6 +1456,7 @@ def monitor_surveys():
 def monitor_events():
     conn = db()
     where, params = monitor_filters()
+    where = f"{where} AND e.type IN {BEHAVIOR_EVENT_SQL}" if where else f" WHERE e.type IN {BEHAVIOR_EVENT_SQL}"
     rows = conn.execute(
         f"""SELECT e.*, t.round_id, t.user_id, c.name AS class_name, u.name AS student_name,
                    u.participant_code AS participant_id
@@ -1599,18 +1604,20 @@ def export_csv():
                             [ans.get("comment", "")])
     else:
         filename = "events.csv"
-        header = ["participant_id", "task_id", "学生", "班级", "任务", "序号", "事件", "详情", "视频位置", "发生时间"]
+        header = ["班级", "学生", "学号", "行为事件", "发生时间"]
+        where, params = monitor_filters()
+        where = f"{where} AND e.type IN {BEHAVIOR_EVENT_SQL}" if where else f" WHERE e.type IN {BEHAVIOR_EVENT_SQL}"
         events = conn.execute(
             f"""SELECT e.*, t.round_id, c.name AS class_name, u.name AS student_name,
-                       u.participant_code AS participant_id
+                       u.student_no
                 FROM events e JOIN tasks t ON t.id=e.task_id
                 JOIN classes c ON c.id=t.class_id JOIN users u ON u.id=t.user_id
-                {monitor_filters()[0]} ORDER BY e.occurred_at""",
-            monitor_filters()[1],
+                {where} ORDER BY e.occurred_at""",
+            params,
         ).fetchall()
-        data = [[e["participant_id"], e["task_id"], e["student_name"], e["class_name"],
-                 ROUNDS[e["round_id"]], e["seq"], e["type"], e["detail"] or "",
-                 e["position"] if e["position"] is not None else "", e["occurred_at"]]
+        data = [[e["class_name"], e["student_name"], e["student_no"],
+                 f"{e['type']}（{e['detail']}）" if e["detail"] else e["type"],
+                 e["occurred_at"]]
                 for e in events]
     conn.close()
     if request.args.get("names") == "zh":
@@ -1620,7 +1627,7 @@ def export_csv():
         }.get(kind, filename)
     if anonymous:
         drop = {"tasks": [2, 3], "participants": [1, 2],
-                "versions": [2], "feedback": [2], "events": [2], "surveys": [1, 2]}.get(kind, [])
+                "versions": [2], "feedback": [2], "events": [1, 2], "surveys": [1, 2]}.get(kind, [])
         if drop:
             header, data = drop_columns(header, data, drop)
         filename = filename.replace(".csv", "-anonymous.csv")
@@ -1682,7 +1689,10 @@ def export_task_events(task_id):
     if not row:
         conn.close()
         return jsonify({"error": "任务不存在"}), 404
-    events = conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY seq", (task_id,)).fetchall()
+    events = conn.execute(
+        f"SELECT * FROM events WHERE task_id=? AND type IN {BEHAVIOR_EVENT_SQL} ORDER BY seq",
+        (task_id,),
+    ).fetchall()
     conn.close()
     lines = [
         f"被试编号：{row['participant_code']} · 任务 {task_id} · {row['class_name']} · {ROUNDS[row['round_id']]}",
