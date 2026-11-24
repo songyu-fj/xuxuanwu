@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
+from contextlib import closing
 from datetime import datetime
 from functools import wraps
 from urllib.parse import quote
@@ -46,30 +47,7 @@ CLASSES = [(1, "物理1班"), (2, "物理2班"), (3, "化学1班"), (4, "化学2
 DEFAULT_CONFIGS = {1: ("none", 0), 2: ("none", 1), 3: ("later", 1), 4: ("first", 1)}
 ALLOWED_VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".wmv", ".flv"}
 
-DEFAULT_SETTINGS = {"fixed_sequence": "1", "survey_pre": "1", "survey_post": "1"}
-SCALE_LABELS = {1: "完全不符合", 2: "比较不符合", 3: "一般", 4: "比较符合", 5: "完全符合"}
-SURVEY_DEFS = {
-    "pre": {
-        "name": "实验前问卷",
-        "items": [
-            ("q1", "我清楚教学反思应该关注哪些方面。"),
-            ("q2", "我经常在课后回顾自己的课堂教学。"),
-            ("q3", "我会依据课堂中的具体片段来解释自己的判断。"),
-            ("q4", "我了解 AI 可以如何帮助我改进教学。"),
-            ("q5", "我愿意参考 AI 给出的教学建议。"),
-        ],
-    },
-    "post": {
-        "name": "实验后问卷",
-        "items": [
-            ("q1", "本次任务中的反思帮助我梳理了教学中的问题。"),
-            ("q2", "AI 建议帮助我发现了原先没有注意到的细节。"),
-            ("q3", "我能区分 AI 建议与自己的判断。"),
-            ("q4", "本次任务的操作流程清晰、容易完成。"),
-            ("q5", "我愿意在以后的教学中继续使用这种反思方式。"),
-        ],
-    },
-}
+DEFAULT_SETTINGS = {"fixed_sequence": "1"}
 
 for d in (DATA_DIR, VIDEO_DIR, RAW_DIR):
     os.makedirs(d, exist_ok=True)
@@ -139,6 +117,15 @@ def init_db():
           id INTEGER PRIMARY KEY,
           name TEXT NOT NULL UNIQUE
         );
+        CREATE TABLE IF NOT EXISTS class_videos(
+          class_id INTEGER PRIMARY KEY REFERENCES classes(id),
+          status TEXT NOT NULL CHECK(status IN ('processing','ready','failed')),
+          upload_name TEXT,
+          raw_path TEXT,
+          video_name TEXT,
+          video_path TEXT,
+          duration REAL
+        );
         CREATE TABLE IF NOT EXISTS users(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           role TEXT NOT NULL CHECK(role IN ('teacher','student')),
@@ -176,6 +163,15 @@ def init_db():
           submitted_at TEXT,
           UNIQUE(user_id, round_id)
         );
+        CREATE VIEW IF NOT EXISTS task_videos AS
+        SELECT t.id AS task_id,
+               CASE WHEN t.status='submitted' THEN t.video_status
+                    WHEN v.video_path IS NOT NULL THEN 'ready'
+                    ELSE COALESCE(v.status,'empty') END AS video_status,
+               CASE WHEN t.status='submitted' THEN t.video_name ELSE v.video_name END AS video_name,
+               CASE WHEN t.status='submitted' THEN t.video_path ELSE v.video_path END AS video_path,
+               CASE WHEN t.status='submitted' THEN t.duration ELSE v.duration END AS duration
+        FROM tasks t LEFT JOIN class_videos v ON v.class_id=t.class_id;
         CREATE TABLE IF NOT EXISTS reflections(
           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
           stage TEXT NOT NULL,
@@ -221,13 +217,6 @@ def init_db():
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS surveys(
-          user_id INTEGER NOT NULL REFERENCES users(id),
-          kind TEXT NOT NULL,
-          answers TEXT NOT NULL,
-          submitted_at TEXT NOT NULL,
-          PRIMARY KEY(user_id, kind)
-        );
         """
     )
     for cid, cname in CLASSES:
@@ -258,11 +247,8 @@ def init_db():
     ).fetchall():
         conn.execute("UPDATE users SET participant_code=? WHERE id=?", (f"P{r['id']:04d}", r["id"]))
     # 上次异常退出遗留的处理中状态，启动时转为可重试的失败状态
-    conn.execute("UPDATE tasks SET video_status='failed' WHERE video_status='processing'")
-    conn.execute(
-        "UPDATE ai_feedback SET status='failed' WHERE status='generating' OR (status='waiting' AND "
-        "task_id IN (SELECT id FROM tasks WHERE flow='first' AND video_status='ready' AND status<>'submitted'))"
-    )
+    conn.execute("UPDATE class_videos SET status='failed' WHERE status='processing'")
+    conn.execute("UPDATE ai_feedback SET status='failed' WHERE status='generating'")
     conn.execute("UPDATE final_feedback SET status='failed' WHERE status='generating'")
     conn.commit()
     conn.close()
@@ -273,21 +259,10 @@ def get_settings(conn):
     return {key: values.get(key, default) == "1" for key, default in DEFAULT_SETTINGS.items()}
 
 
-def survey_items(kind):
-    return [{"id": item_id, "text": text} for item_id, text in SURVEY_DEFS[kind]["items"]]
-
-
-def survey_row(conn, user_id, kind):
-    row = conn.execute("SELECT * FROM surveys WHERE user_id=? AND kind=?", (user_id, kind)).fetchone()
-    if not row:
-        return None
-    return {"answers": json.loads(row["answers"]), "submitted_at": row["submitted_at"]}
-
-
-def tasks_submitted(conn, user_id):
-    statuses = {r["round_id"]: r["status"] for r in conn.execute(
-        "SELECT round_id,status FROM tasks WHERE user_id=?", (user_id,)).fetchall()}
-    return statuses.get(1) == "submitted", statuses.get(2) == "submitted"
+def first_task_submitted(conn, user_id):
+    return conn.execute(
+        "SELECT 1 FROM tasks WHERE user_id=? AND round_id=1 AND status='submitted'", (user_id,)
+    ).fetchone() is not None
 
 
 def log_event(conn, task_id, type_, detail="", position=None):
@@ -362,31 +337,16 @@ def login_required(role=None):
 
 @app.before_request
 def enforce_student_flow():
-    """学生任务接口统一校验：前测问卷与固定任务顺序。"""
+    """启用固定任务顺序时，仅在课堂练习提交后开放课后反思。"""
     match = re.match(r"^/api/student/task/(\d+)", request.path)
-    if not match:
+    if not match or int(match.group(1)) != 2:
         return None
     user = current_user()
     if not user or user["role"] != "student":
         return None
-    round_id = int(match.group(1))
-    conn = db()
-    settings = get_settings(conn)
-    if settings["survey_pre"]:
-        done = conn.execute(
-            "SELECT 1 FROM surveys WHERE user_id=? AND kind='pre'", (user["id"],)
-        ).fetchone()
-        if not done:
-            conn.close()
-            return jsonify({"error": "请先完成实验前问卷"}), 403
-    if settings["fixed_sequence"] and round_id == 2:
-        first = conn.execute(
-            "SELECT status FROM tasks WHERE user_id=? AND round_id=1", (user["id"],)
-        ).fetchone()
-        if not first or first["status"] != "submitted":
-            conn.close()
+    with closing(db()) as conn:
+        if get_settings(conn)["fixed_sequence"] and not first_task_submitted(conn, user["id"]):
             return jsonify({"error": "请先完成课堂练习并提交，再进入课后反思"}), 403
-    conn.close()
     return None
 
 
@@ -511,10 +471,19 @@ def get_or_create_task(conn, user, round_id):
     return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
 
 
+def task_video_for(conn, task_id):
+    return conn.execute("SELECT * FROM task_videos WHERE task_id=?", (task_id,)).fetchone()
+
+
+def video_version(video):
+    return os.path.basename(video["video_path"]) if video["video_path"] else None
+
+
 def task_payload(conn, task):
+    video = task_video_for(conn, task["id"])
     stages = stages_dict(conn, task["id"])
     ai = None
-    if task["flow"] == "first":
+    if task["flow"] == "first" and video["video_status"] == "ready":
         ai = conn.execute("SELECT * FROM ai_feedback WHERE task_id=?", (task["id"],)).fetchone()
     initial = latest_snapshot(conn, task["id"], "initial")
     final = latest_snapshot(conn, task["id"], "final")
@@ -527,13 +496,13 @@ def task_payload(conn, task):
         "flow": task["flow"],
         "scaffold": bool(task["scaffold"]),
         "status": task["status"],
-        "video_status": task["video_status"],
-        "video_name": task["video_name"],
-        "duration": task["duration"],
+        "video_status": video["video_status"],
+        "video_name": video["video_name"],
+        "video_version": video_version(video),
+        "duration": video["duration"],
         "order_deviation": bool(task["order_deviation"]),
         "submitted_at": task["submitted_at"],
         "created_at": task["created_at"],
-        "can_retry_video": bool(task["raw_path"] and os.path.exists(task["raw_path"])),
         "fixed_sequence": get_settings(conn)["fixed_sequence"],
         "stages": stages,
         "stage_meta": meta,
@@ -541,7 +510,7 @@ def task_payload(conn, task):
         "final": final,
         "final_feedback": final_feedback_for(conn, task["id"]) if final and task["flow"] == "later" else None,
         "ai": {
-            "status": ai["status"] if ai else "locked",
+            "status": ai["status"] if ai else ("waiting" if task["flow"] == "first" else "locked"),
             "items": json.loads(ai["items"]) if ai and ai["items"] else [],
             "requested_at": ai["requested_at"] if ai else None,
             "generated_at": ai["generated_at"] if ai else None,
@@ -556,48 +525,36 @@ def student_overview():
     user = current_user()
     conn = db()
     settings = get_settings(conn)
-    pre = survey_row(conn, user["id"], "pre")
-    post = survey_row(conn, user["id"], "post")
-    first_submitted, second_submitted = tasks_submitted(conn, user["id"])
+    second_locked = settings["fixed_sequence"] and not first_task_submitted(conn, user["id"])
+    group_video = conn.execute("SELECT status,video_path FROM class_videos WHERE class_id=?", (user["class_id"],)).fetchone()
+    group_video_status = "empty"
+    if group_video:
+        group_video_status = "ready" if group_video["video_path"] else group_video["status"]
     tasks = []
     for rid, rname in ROUNDS.items():
         row = conn.execute("SELECT * FROM tasks WHERE user_id=? AND round_id=?", (user["id"], rid)).fetchone()
         flow, scaffold = config_for(conn, user["class_id"], rid)
-        locked, reason = False, ""
-        if settings["survey_pre"] and not pre:
-            locked, reason = True, "请先完成实验前问卷"
-        elif settings["fixed_sequence"] and rid == 2 and not first_submitted:
-            locked, reason = True, "请先完成课堂练习并提交"
+        locked = rid == 2 and second_locked
+        reason = "请先完成课堂练习并提交" if locked else ""
         if row:
             tasks.append({
                 "round_id": rid, "round_name": rname, "exists": True,
                 "flow": row["flow"], "scaffold": bool(row["scaffold"]),
-                "status": row["status"], "video_status": row["video_status"],
+                "status": row["status"],
+                "video_status": row["video_status"] if row["status"] == "submitted" else group_video_status,
                 "submitted_at": row["submitted_at"], "locked": locked, "lock_reason": reason,
             })
         else:
             tasks.append({
                 "round_id": rid, "round_name": rname, "exists": False,
                 "flow": flow, "scaffold": bool(scaffold),
-                "status": "not_started", "video_status": "empty", "submitted_at": None,
+                "status": "not_started", "video_status": group_video_status, "submitted_at": None,
                 "locked": locked, "lock_reason": reason,
             })
     conn.close()
     return jsonify({
         "tasks": tasks,
         "settings": settings,
-        "surveys": {
-            "pre": {
-                "enabled": settings["survey_pre"], "submitted": bool(pre),
-                "submitted_at": pre["submitted_at"] if pre else None,
-            },
-            "post": {
-                "enabled": settings["survey_post"],
-                "unlocked": first_submitted and second_submitted,
-                "submitted": bool(post),
-                "submitted_at": post["submitted_at"] if post else None,
-            },
-        },
         "user": {
             "name": user["name"], "class_name": user["class_name"],
             "participant_code": user["participant_code"],
@@ -611,77 +568,115 @@ def student_task(round_id):
     if round_id not in ROUNDS:
         return jsonify({"error": "任务不存在"}), 404
     user = current_user()
-    conn = db()
-    task = get_or_create_task(conn, user, round_id)
-    payload = task_payload(conn, task)
-    conn.close()
+    with closing(db()) as conn:
+        task = get_or_create_task(conn, user, round_id)
+        conn.execute("BEGIN")
+        payload = task_payload(conn, task)
+    if payload["ai"]["status"] == "waiting" and payload["video_status"] == "ready" and task["status"] != "submitted":
+        start_ai(task["id"], retry=False)
     return jsonify(payload)
 
 
-@app.post("/api/student/task/<int:round_id>/video")
-@login_required("student")
-def upload_video(round_id):
-    user = current_user()
-    conn = db()
-    task = get_or_create_task(conn, user, round_id)
-    if task["status"] == "submitted":
-        conn.close()
-        return jsonify({"error": "本轮任务已提交，不能再更换视频"}), 400
-    if task["video_status"] == "processing":
-        conn.close()
-        return jsonify({"error": "视频正在处理中，请稍候"}), 400
-    ai = conn.execute("SELECT status,presented_at FROM ai_feedback WHERE task_id=?", (task["id"],)).fetchone()
-    linked = conn.execute("SELECT 1 FROM snapshots WHERE task_id=? AND kind='initial'", (task["id"],)).fetchone()
-    if task["video_status"] == "ready" and (linked or (ai and (ai["presented_at"] or ai["status"] in ("generating", "ready")))):
-        conn.close()
-        return jsonify({"error": "本任务的视频已关联初稿或 AI 反馈，为保持素材一致，不能更换"}), 400
-    f = request.files.get("video")
-    if not f or not f.filename:
-        conn.close()
+# ---------------------------------------------------------------- 小组视频
+
+@app.get("/api/teacher/videos")
+@login_required("teacher")
+def teacher_videos():
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT c.id,c.name,v.status,v.upload_name,v.raw_path,v.video_name,v.video_path,v.duration "
+            "FROM classes c LEFT JOIN class_videos v ON v.class_id=c.id ORDER BY c.id"
+        ).fetchall()
+    return jsonify({"groups": [{
+        "class_id": row["id"],
+        "class_name": row["name"],
+        "status": row["status"] or "empty",
+        "upload_name": row["upload_name"],
+        "video_name": row["video_name"],
+        "video_version": video_version(row),
+        "duration": row["duration"],
+        "can_retry": row["status"] == "failed" and bool(row["raw_path"] and os.path.isfile(row["raw_path"])),
+    } for row in rows]})
+
+
+def remove_media_file(path):
+    if path:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            app.logger.warning("清理视频文件失败：%s", exc)
+
+
+@app.post("/api/teacher/classes/<int:class_id>/video")
+@login_required("teacher")
+def upload_class_video(class_id):
+    with closing(db()) as conn:
+        if not conn.execute("SELECT 1 FROM classes WHERE id=?", (class_id,)).fetchone():
+            return jsonify({"error": "小组不存在"}), 404
+    upload = request.files.get("video")
+    if not upload or not upload.filename:
         return jsonify({"error": "请选择视频文件"}), 400
-    ext = os.path.splitext(f.filename)[1].lower()
+    ext = os.path.splitext(upload.filename)[1].lower()
     if ext not in ALLOWED_VIDEO_EXT:
-        conn.close()
         return jsonify({"error": "不支持的视频格式，请上传 mp4 / mov / webm 等常见格式"}), 400
-    raw_name = f"{task['id']}-{uuid.uuid4().hex[:8]}{ext}"
-    raw_path = os.path.join(RAW_DIR, raw_name)
-    f.save(raw_path)
-    conn.execute(
-        "UPDATE tasks SET video_status='processing', video_name=?, raw_path=?, video_path=NULL, duration=NULL WHERE id=?",
-        (f.filename, raw_path, task["id"]),
-    )
-    log_event(conn, task["id"], "上传开始", f.filename)
-    conn.commit()
-    conn.close()
-    threading.Thread(target=transcode, args=(task["id"], raw_path), daemon=True).start()
-    return jsonify({"ok": True, "video_status": "processing"})
+    raw_path = os.path.join(RAW_DIR, f"class-{class_id}-{uuid.uuid4().hex}{ext}")
+    accepted = False
+    try:
+        upload.save(raw_path)
+        if os.path.getsize(raw_path) == 0:
+            return jsonify({"error": "所选文件为空，请重新选择视频"}), 400
+        with closing(db()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute("SELECT status,raw_path FROM class_videos WHERE class_id=?", (class_id,)).fetchone()
+            if previous and previous["status"] == "processing":
+                return jsonify({"error": "本组已有视频正在处理，请稍候"}), 409
+            conn.execute(
+                "INSERT INTO class_videos(class_id,status,upload_name,raw_path) VALUES(?,'processing',?,?) "
+                "ON CONFLICT(class_id) DO UPDATE SET status='processing',"
+                "upload_name=excluded.upload_name,raw_path=excluded.raw_path",
+                (class_id, upload.filename, raw_path),
+            )
+        accepted = True
+    finally:
+        if not accepted:
+            remove_media_file(raw_path)
+    if previous:
+        remove_media_file(previous["raw_path"])
+    return launch_class_transcode(class_id, raw_path)
 
 
-@app.post("/api/student/task/<int:round_id>/video/retry")
-@login_required("student")
-def retry_video(round_id):
-    user = current_user()
-    conn = db()
-    task = get_or_create_task(conn, user, round_id)
-    if task["status"] == "submitted":
-        conn.close()
-        return jsonify({"error": "本轮任务已提交，不能再处理视频"}), 400
-    if task["video_status"] == "processing":
-        conn.close()
-        return jsonify({"error": "视频正在处理中，请稍候"}), 400
-    raw_path = task["raw_path"]
-    if not raw_path or not os.path.exists(raw_path):
-        conn.close()
-        return jsonify({"error": "原始视频已不可用，请重新上传"}), 400
-    conn.execute(
-        "UPDATE tasks SET video_status='processing', video_path=NULL, duration=NULL WHERE id=?",
-        (task["id"],),
-    )
-    log_event(conn, task["id"], "转码重试", "复用已上传的原始视频")
-    conn.commit()
-    conn.close()
-    threading.Thread(target=transcode, args=(task["id"], raw_path), daemon=True).start()
-    return jsonify({"ok": True, "video_status": "processing"})
+@app.post("/api/teacher/classes/<int:class_id>/video/retry")
+@login_required("teacher")
+def retry_class_video(class_id):
+    with closing(db()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        video = conn.execute("SELECT status,raw_path FROM class_videos WHERE class_id=?", (class_id,)).fetchone()
+        if not video or video["status"] != "failed":
+            return jsonify({"error": "只有处理失败的视频可以重试"}), 409
+        raw_path = video["raw_path"]
+        if not raw_path or not os.path.isfile(raw_path):
+            return jsonify({"error": "原始视频已不可用，请重新上传"}), 400
+        conn.execute("UPDATE class_videos SET status='processing' WHERE class_id=?", (class_id,))
+    return launch_class_transcode(class_id, raw_path)
+
+
+def launch_class_transcode(class_id, raw_path):
+    try:
+        threading.Thread(target=transcode_class_video, args=(class_id, raw_path), daemon=True).start()
+    except RuntimeError:
+        mark_class_video_failed(class_id, raw_path)
+        return jsonify({"error": "暂时无法开始处理，请重试"}), 503
+    return jsonify({"ok": True, "status": "processing"}), 202
+
+
+def mark_class_video_failed(class_id, raw_path):
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "UPDATE class_videos SET status='failed' WHERE class_id=? AND raw_path=? AND status='processing'",
+            (class_id, raw_path),
+        )
 
 
 def ffmpeg_duration(text):
@@ -691,54 +686,73 @@ def ffmpeg_duration(text):
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
-def transcode(task_id, raw_path):
-    out_path = os.path.join(VIDEO_DIR, f"{task_id}.mp4")
+def transcode_class_video(class_id, raw_path):
+    out_path = os.path.join(VIDEO_DIR, os.path.splitext(os.path.basename(raw_path))[0] + ".mp4")
     cmd = [
-        FFMPEG, "-y", "-i", raw_path,
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
+        FFMPEG, "-nostdin", "-hide_banner", "-y", "-i", raw_path,
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "26",
         "-c:a", "aac", "-b:a", "96k", "-ac", "2",
         "-movflags", "+faststart", out_path,
     ]
-    conn = db()
-    should_start_ai = False
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if proc.returncode != 0 or not os.path.exists(out_path):
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
+        if proc.returncode != 0 or not os.path.isfile(out_path):
             raise RuntimeError((proc.stderr or "ffmpeg 转码失败")[-400:])
-        duration = ffmpeg_duration(proc.stderr)
-        conn.execute(
-            "UPDATE tasks SET video_status='ready', video_path=?, duration=? WHERE id=?",
-            (out_path, duration, task_id),
-        )
-        log_event(conn, task_id, "标准视频就绪", "H.264 / AAC / 720p MP4")
-        task = conn.execute("SELECT flow,status FROM tasks WHERE id=?", (task_id,)).fetchone()
-        conn.commit()
-        should_start_ai = bool(task and task["status"] != "submitted" and task["flow"] == "first")
+        with closing(db()) as conn, conn:
+            published = conn.execute(
+                "UPDATE class_videos SET status='ready',video_name=upload_name,video_path=?,duration=?,"
+                "upload_name=NULL,raw_path=NULL WHERE class_id=? AND raw_path=? AND status='processing'",
+                (out_path, ffmpeg_duration(proc.stderr), class_id, raw_path),
+            ).rowcount
+            if published:
+                # 未提交任务的 AI 建议需要按新视频重新定位时间点。
+                conn.execute(
+                    "UPDATE ai_feedback SET status='waiting',items=NULL,requested_at=NULL,generated_at=NULL,presented_at=NULL "
+                    "WHERE task_id IN (SELECT id FROM tasks WHERE class_id=? AND flow='first' AND status<>'submitted')",
+                    (class_id,),
+                )
     except Exception as exc:
-        conn.execute("UPDATE tasks SET video_status='failed' WHERE id=?", (task_id,))
-        log_event(conn, task_id, "转码失败", str(exc)[:300])
-        conn.commit()
-    finally:
-        conn.close()
-    if should_start_ai:
-        start_ai(task_id)
+        app.logger.warning("小组视频转码失败 class=%s：%s", class_id, exc)
+        remove_media_file(out_path)
+        mark_class_video_failed(class_id, raw_path)
+        return
+    remove_media_file(raw_path if published else out_path)
+
+
+def serve_video(video):
+    version = request.args.get("v")
+    if not video or not video["video_path"] or not os.path.isfile(video["video_path"]):
+        return jsonify({"error": "视频不存在"}), 404
+    if version and version != video_version(video):
+        return jsonify({"error": "视频已更新，请刷新后观看"}), 404
+    return send_file(video["video_path"], mimetype="video/mp4", conditional=True)
+
+
+@app.get("/media/class-video/<int:class_id>")
+@login_required("teacher")
+def media_class_video(class_id):
+    with closing(db()) as conn:
+        video = conn.execute("SELECT video_path FROM class_videos WHERE class_id=?", (class_id,)).fetchone()
+    return serve_video(video)
 
 
 @app.get("/media/video/<int:task_id>")
+@login_required()
 def media_video(task_id):
     user = current_user()
-    if not user:
-        return jsonify({"error": "请先登录"}), 401
-    conn = db()
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    conn.close()
-    if not task or not task["video_path"]:
+    with closing(db()) as conn:
+        task = conn.execute(
+            "SELECT t.user_id,v.video_path FROM tasks t JOIN task_videos v ON v.task_id=t.id WHERE t.id=?",
+            (task_id,),
+        ).fetchone()
+    if not task:
         return jsonify({"error": "视频不存在"}), 404
     if user["role"] == "student" and task["user_id"] != user["id"]:
         return jsonify({"error": "没有访问权限"}), 403
-    return send_file(task["video_path"], mimetype="video/mp4", conditional=True)
+    return serve_video(task)
 
 
 # ---------------------------------------------------------------- 反思、AI、提交
@@ -767,40 +781,36 @@ def ai_items(duration):
     ]
 
 
-def start_ai(task_id, delay=2.5):
-    conn = db()
-    task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if not task or task["flow"] != "first" or task["status"] == "submitted" or task["video_status"] != "ready":
-        conn.close()
-        return
-    changed = conn.execute(
-        "UPDATE ai_feedback SET status='generating', requested_at=?, generated_at=NULL, presented_at=NULL "
-        "WHERE task_id=? AND status IN ('waiting','failed')",
-        (now(), task_id),
-    ).rowcount
-    if not changed:
-        conn.close()
-        return
-    log_event(conn, task_id, "AI 请求", "按片头 / 片中 / 片尾生成观察与建议")
-    conn.commit()
-    conn.close()
+def start_ai(task_id, retry=True):
+    with closing(db()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = conn.execute(
+            "SELECT t.flow,t.status,v.video_path,v.duration FROM tasks t "
+            "JOIN task_videos v ON v.task_id=t.id WHERE t.id=?",
+            (task_id,),
+        ).fetchone()
+        if not task or task["flow"] != "first" or task["status"] == "submitted" or not task["video_path"]:
+            return
+        changed = conn.execute(
+            "UPDATE ai_feedback SET status='generating', requested_at=?, generated_at=NULL, presented_at=NULL "
+            "WHERE task_id=? AND (status='waiting' OR (? AND status='failed'))",
+            (now(), task_id, retry),
+        ).rowcount
+        if not changed:
+            return
+        log_event(conn, task_id, "AI 请求", "按片头 / 片中 / 片尾生成观察与建议")
 
     def finish():
-        c = db()
-        try:
-            t = c.execute("SELECT duration,status,flow FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if not t or t["status"] == "submitted" or t["flow"] != "first":
-                return
-            c.execute(
-                "UPDATE ai_feedback SET status='ready', items=?, generated_at=? WHERE task_id=?",
-                (json.dumps(ai_items(t["duration"]), ensure_ascii=False), now(), task_id),
-            )
-            log_event(c, task_id, "反馈生成完成", "内置模拟反馈 v0.1")
-            c.commit()
-        finally:
-            c.close()
+        with closing(db()) as conn, conn:
+            changed = conn.execute(
+                "UPDATE ai_feedback SET status='ready', items=?, generated_at=? WHERE task_id=? AND status='generating' "
+                "AND EXISTS (SELECT 1 FROM task_videos WHERE task_id=? AND video_path=?)",
+                (json.dumps(ai_items(task["duration"]), ensure_ascii=False), now(), task_id, task_id, task["video_path"]),
+            ).rowcount
+            if changed:
+                log_event(conn, task_id, "反馈生成完成", "内置模拟反馈 v0.1")
 
-    timer = threading.Timer(delay, finish)
+    timer = threading.Timer(2.5, finish)
     timer.daemon = True
     timer.start()
 
@@ -881,7 +891,8 @@ def launch_final_feedback(task_id, stages):
 
 def awaiting_first_feedback(conn, task):
     return task["flow"] == "first" and not conn.execute(
-        "SELECT 1 FROM ai_feedback WHERE task_id=? AND status='ready' AND presented_at IS NOT NULL",
+        "SELECT 1 FROM ai_feedback a JOIN task_videos v ON v.task_id=a.task_id "
+        "WHERE a.task_id=? AND a.status='ready' AND a.presented_at IS NOT NULL AND v.video_status='ready'",
         (task["id"],),
     ).fetchone()
 
@@ -985,15 +996,20 @@ def confirm_initial(round_id):
 @login_required("student")
 def submit_task(round_id):
     user = current_user()
+    body = request.get_json(silent=True) or {}
     conn = db()
     conn.execute("BEGIN IMMEDIATE")
     task = get_or_create_task(conn, user, round_id)
     if task["status"] == "submitted":
         conn.close()
         return jsonify({"error": "本轮已提交"}), 400
-    if task["video_status"] != "ready":
+    video = task_video_for(conn, task["id"])
+    if video["video_status"] != "ready":
         conn.close()
-        return jsonify({"error": "请先上传视频并等待处理完成"}), 400
+        return jsonify({"error": "请等待教师设置的小组视频就绪"}), 400
+    if isinstance(body, dict) and "video_version" in body and body["video_version"] != video_version(video):
+        conn.close()
+        return jsonify({"error": "小组视频已更新，请查看后重新提交"}), 409
     if awaiting_first_feedback(conn, task):
         conn.close()
         return jsonify({"error": "请等待 AI 反馈呈现后再提交"}), 409
@@ -1002,7 +1018,10 @@ def submit_task(round_id):
         conn.close()
         return jsonify({"error": "请先填写至少一个阶段的反思内容"}), 400
     snapshot(conn, task["id"], "final", content)
-    conn.execute("UPDATE tasks SET status='submitted', submitted_at=? WHERE id=?", (now(), task["id"]))
+    conn.execute(
+        "UPDATE tasks SET status='submitted',submitted_at=?,video_status='ready',video_path=?,video_name=?,duration=? WHERE id=?",
+        (now(), video["video_path"], video["video_name"], video["duration"], task["id"]),
+    )
     if task["flow"] == "later":
         conn.execute(
             "INSERT INTO final_feedback(task_id,status,requested_at) VALUES(?,'generating',?)",
@@ -1065,11 +1084,18 @@ def final_feedback_present(round_id):
 @login_required("student")
 def ai_present(round_id):
     user = current_user()
+    body = request.get_json(silent=True) or {}
     conn = db()
+    conn.execute("BEGIN IMMEDIATE")
     task = get_or_create_task(conn, user, round_id)
     if task["flow"] != "first":
         conn.close()
         return jsonify({"error": "当前任务不使用前置 AI 反馈"}), 409
+    video = task_video_for(conn, task["id"])
+    stale = isinstance(body, dict) and "video_version" in body and body["video_version"] != video_version(video)
+    if video["video_status"] != "ready" or stale:
+        conn.close()
+        return jsonify({"error": "请先查看当前小组视频对应的 AI 建议"}), 409
     changed = conn.execute(
         "UPDATE ai_feedback SET presented_at=? WHERE task_id=? AND status='ready' AND presented_at IS NULL",
         (now(), task["id"]),
@@ -1088,10 +1114,11 @@ def ai_retry(round_id):
     user = current_user()
     conn = db()
     task = get_or_create_task(conn, user, round_id)
+    video = task_video_for(conn, task["id"])
     conn.close()
     if task["flow"] != "first":
         return jsonify({"error": "当前任务不使用前置 AI 反馈"}), 409
-    if task["video_status"] != "ready":
+    if video["video_status"] != "ready":
         return jsonify({"error": "请等待视频处理完成"}), 400
     start_ai(task["id"])
     return jsonify({"ok": True})
@@ -1132,84 +1159,10 @@ def student_records():
             "stages": payload["stages"], "stage_meta": payload["stage_meta"],
             "initial": payload["initial"], "final": payload["final"],
             "final_feedback": payload["final_feedback"],
-            "video_name": task["video_name"],
+            "video_name": payload["video_name"],
         })
     conn.close()
     return jsonify({"records": result})
-
-
-# ---------------------------------------------------------------- 前后测问卷
-
-@app.get("/api/student/surveys")
-@login_required("student")
-def student_surveys():
-    user = current_user()
-    conn = db()
-    settings = get_settings(conn)
-    pre = survey_row(conn, user["id"], "pre")
-    post = survey_row(conn, user["id"], "post")
-    first_submitted, second_submitted = tasks_submitted(conn, user["id"])
-    conn.close()
-    return jsonify({
-        "settings": settings,
-        "items": {"pre": survey_items("pre"), "post": survey_items("post")},
-        "scale": {str(k): v for k, v in SCALE_LABELS.items()},
-        "pre": {
-            "enabled": settings["survey_pre"], "submitted": bool(pre),
-            "submitted_at": pre["submitted_at"] if pre else None,
-            "answers": pre["answers"] if pre else None,
-        },
-        "post": {
-            "enabled": settings["survey_post"],
-            "unlocked": first_submitted and second_submitted,
-            "submitted": bool(post),
-            "submitted_at": post["submitted_at"] if post else None,
-            "answers": post["answers"] if post else None,
-        },
-    })
-
-
-@app.post("/api/student/survey/<kind>")
-@login_required("student")
-def submit_survey(kind):
-    if kind not in SURVEY_DEFS:
-        return jsonify({"error": "问卷不存在"}), 404
-    user = current_user()
-    conn = db()
-    settings = get_settings(conn)
-    if not settings["survey_" + kind]:
-        conn.close()
-        return jsonify({"error": "该问卷未启用"}), 400
-    if survey_row(conn, user["id"], kind):
-        conn.close()
-        return jsonify({"error": "该问卷已提交，不能重复填写"}), 400
-    if kind == "post":
-        first_submitted, second_submitted = tasks_submitted(conn, user["id"])
-        if not (first_submitted and second_submitted):
-            conn.close()
-            return jsonify({"error": "请先完成课堂练习和课后反思后再填写实验后问卷"}), 400
-    body = request.get_json(silent=True) or {}
-    answers = body.get("answers") or {}
-    scores = {}
-    for item_id, _text in SURVEY_DEFS[kind]["items"]:
-        try:
-            score = int(answers.get(item_id))
-        except (TypeError, ValueError):
-            conn.close()
-            return jsonify({"error": "请完成所有题目后再提交"}), 400
-        if score not in SCALE_LABELS:
-            conn.close()
-            return jsonify({"error": "题目选项无效"}), 400
-        scores[item_id] = score
-    comment = (body.get("comment") or "").strip()[:1000] if kind == "post" else ""
-    scores["comment"] = comment
-    conn.execute(
-        "INSERT INTO surveys(user_id,kind,answers,submitted_at) VALUES(?,?,?,?)",
-        (user["id"], kind, json.dumps(scores, ensure_ascii=False), now()),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------- 教师端
@@ -1290,9 +1243,11 @@ def monitor_rows(conn):
     where, params = monitor_filters()
     sql = f"""
         SELECT t.*, u.name AS student_name, u.student_no, u.participant_code AS participant_id,
+               v.video_status AS effective_video_status,
                c.name AS class_name,
                a.status AS ai_status, a.requested_at, a.generated_at, a.presented_at, a.items AS ai_items
         FROM tasks t JOIN users u ON u.id=t.user_id JOIN classes c ON c.id=t.class_id
+        JOIN task_videos v ON v.task_id=t.id
         LEFT JOIN ai_feedback a ON a.task_id=t.id
         {where} ORDER BY t.created_at DESC
     """
@@ -1330,7 +1285,7 @@ def monitor_tasks():
                 "status": t["status"] if t else "not_started",
                 "flow": FLOWS.get(t["flow"], "") if t else "",
                 "scaffold": bool(t["scaffold"]) if t else None,
-                "video_status": t["video_status"] if t else "",
+                "video_status": t["effective_video_status"] if t else "",
                 "submitted_at": t["submitted_at"] if t else None,
                 "duration_seconds": seconds_between(t["created_at"], t["submitted_at"]) if t else None,
                 "order_deviation": bool(t["order_deviation"]) if t else False,
@@ -1415,42 +1370,6 @@ def monitor_feedback():
     return jsonify({"rows": result})
 
 
-@app.get("/api/teacher/monitor/surveys")
-@login_required("teacher")
-def monitor_surveys():
-    conn = db()
-    class_arg = request.args.get("class_id", "").strip()
-    sql = """SELECT u.id,u.name,u.student_no,u.participant_code,c.name AS class_name
-             FROM users u JOIN classes c ON c.id=u.class_id WHERE u.role='student'"""
-    params = []
-    if class_arg.isdigit():
-        sql += " AND c.id=?"
-        params.append(int(class_arg))
-    sql += " ORDER BY u.id"
-    students = conn.execute(sql, params).fetchall()
-    result = []
-    for s in students:
-        item = {
-            "participant_id": s["participant_code"], "student_name": s["name"],
-            "student_no": s["student_no"], "class_name": s["class_name"],
-            "pre": None, "post": None,
-        }
-        for kind in ("pre", "post"):
-            row = conn.execute(
-                "SELECT answers,submitted_at FROM surveys WHERE user_id=? AND kind=?",
-                (s["id"], kind),
-            ).fetchone()
-            if row:
-                item[kind] = {"answers": json.loads(row["answers"]), "submitted_at": row["submitted_at"]}
-        result.append(item)
-    conn.close()
-    return jsonify({
-        "rows": result,
-        "items": {"pre": survey_items("pre"), "post": survey_items("post")},
-        "scale": {str(k): v for k, v in SCALE_LABELS.items()},
-    })
-
-
 @app.get("/api/teacher/monitor/events")
 @login_required("teacher")
 def monitor_events():
@@ -1496,6 +1415,8 @@ def drop_columns(header, data, indexes):
 @login_required("teacher")
 def export_csv():
     kind = request.args.get("type", "tasks")
+    if kind not in ("tasks", "participants", "versions", "feedback", "events"):
+        return jsonify({"error": "导出类型不存在"}), 404
     anonymous = request.args.get("anonymous") == "1"
     conn = db()
     rows = monitor_rows(conn)
@@ -1506,7 +1427,7 @@ def export_csv():
         data = [[r["participant_id"], r["id"], r["student_name"], r["student_no"],
                  r["class_name"], ROUNDS[r["round_id"]],
                  FLOWS.get(r["flow"], r["flow"]), "开启" if r["scaffold"] else "关闭",
-                 VIDEO_STATUS.get(r["video_status"], r["video_status"]),
+                 VIDEO_STATUS.get(r["effective_video_status"], r["effective_video_status"]),
                  "已提交" if r["status"] == "submitted" else "进行中",
                  r["submitted_at"] or "",
                  seconds_between(r["created_at"], r["submitted_at"]) or "",
@@ -1516,14 +1437,12 @@ def export_csv():
     elif kind == "participants":
         filename = "participants.csv"
         header = ["participant_id", "姓名", "学号", "班级", "课堂练习流程", "课堂练习状态",
-                  "课后反思流程", "课后反思状态", "前测状态", "后测状态", "注册时间"]
+                  "课后反思流程", "课后反思状态", "注册时间"]
         sql = """SELECT u.*, c.name AS class_name,
                    (SELECT flow FROM configs WHERE class_id=u.class_id AND round_id=1) AS flow1,
                    (SELECT flow FROM configs WHERE class_id=u.class_id AND round_id=2) AS flow2,
                    (SELECT status FROM tasks WHERE user_id=u.id AND round_id=1) AS status1,
-                   (SELECT status FROM tasks WHERE user_id=u.id AND round_id=2) AS status2,
-                   (SELECT 1 FROM surveys WHERE user_id=u.id AND kind='pre') AS pre_done,
-                   (SELECT 1 FROM surveys WHERE user_id=u.id AND kind='post') AS post_done
+                   (SELECT status FROM tasks WHERE user_id=u.id AND round_id=2) AS status2
                  FROM users u JOIN classes c ON c.id=u.class_id
                  WHERE u.role='student'"""
         params = []
@@ -1538,9 +1457,7 @@ def export_csv():
             return {"submitted": "已提交", "in_progress": "进行中"}.get(v, "未开始")
         data = [[s["participant_code"], s["name"], s["student_no"], s["class_name"],
                  FLOWS.get(s["flow1"], ""), status_label(s["status1"]),
-                 FLOWS.get(s["flow2"], ""), status_label(s["status2"]),
-                 "已完成" if s["pre_done"] else "未填写",
-                 "已完成" if s["post_done"] else "未填写", s["created_at"]]
+                 FLOWS.get(s["flow2"], ""), status_label(s["status2"]), s["created_at"]]
                 for s in students]
     elif kind == "versions":
         filename = "text_versions.csv"
@@ -1577,31 +1494,6 @@ def export_csv():
                          entry["round_name"], AI_STATUS.get(entry["status"], entry["status"]),
                          entry["model"] or "", entry["prompt_version"], entry["requested_at"] or "",
                          entry["generated_at"] or "", entry["presented_at"] or "", text, entry["kind"]])
-    elif kind == "surveys":
-        filename = "surveys.csv"
-        header = ["participant_id", "姓名", "学号", "班级", "问卷", "提交时间",
-                  "q1", "q2", "q3", "q4", "q5", "其他想法"]
-        data = []
-        students = conn.execute(
-            "SELECT u.*,c.name AS class_name FROM users u JOIN classes c ON c.id=u.class_id "
-            "WHERE u.role='student' ORDER BY u.id"
-        ).fetchall()
-        class_arg = request.args.get("class_id", "").strip()
-        for s in students:
-            if class_arg.isdigit() and s["class_id"] != int(class_arg):
-                continue
-            for skind in ("pre", "post"):
-                row = conn.execute(
-                    "SELECT answers,submitted_at FROM surveys WHERE user_id=? AND kind=?",
-                    (s["id"], skind),
-                ).fetchone()
-                if not row:
-                    continue
-                ans = json.loads(row["answers"])
-                data.append([s["participant_code"], s["name"], s["student_no"], s["class_name"],
-                             SURVEY_DEFS[skind]["name"], row["submitted_at"]] +
-                            [ans.get(item_id, "") for item_id, _ in SURVEY_DEFS[skind]["items"]] +
-                            [ans.get("comment", "")])
     else:
         filename = "events.csv"
         header = ["班级", "学生", "学号", "行为事件", "发生时间"]
@@ -1627,7 +1519,7 @@ def export_csv():
         }.get(kind, filename)
     if anonymous:
         drop = {"tasks": [2, 3], "participants": [1, 2],
-                "versions": [2], "feedback": [2], "events": [1, 2], "surveys": [1, 2]}.get(kind, [])
+                "versions": [2], "feedback": [2], "events": [1, 2]}.get(kind, [])
         if drop:
             header, data = drop_columns(header, data, drop)
         filename = filename.replace(".csv", "-anonymous.csv")

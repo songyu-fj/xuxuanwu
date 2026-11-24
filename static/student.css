@@ -45,6 +45,10 @@
   margin-left: 0;
 }
 
+.video-stage:has(.video-placeholder) {
+  margin-bottom: 14px;
+}
+
 .controls :disabled {
   cursor: default;
 }

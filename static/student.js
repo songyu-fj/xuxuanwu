@@ -7,8 +7,8 @@ const STAGE_PROMPTS = {
   片尾: '总结是否回扣学习目标？是否通过巩固或延伸帮助学生梳理所学？',
 };
 const STAGE_ICONS = { 片头: 'target', 片中: 'book', 片尾: 'check' };
-const STUDENT_PAGE_TITLES = { workspace: '反思工作台', records: '反思记录', survey: '问卷' };
-const STUDENT_VIDEO_LABEL = { ...VIDEO_LABEL, empty: '待上传视频', ready: '标准视频就绪' };
+const STUDENT_PAGE_TITLES = { workspace: '反思工作台', records: '反思记录' };
+const STUDENT_VIDEO_LABEL = { ...VIDEO_LABEL, empty: '待教师设置', ready: '视频就绪' };
 
 Object.assign(state, {
   view: 'workspace',
@@ -16,14 +16,12 @@ Object.assign(state, {
   task: null,
   overview: null,
   workspaceRequest: 0,
+  taskRefresh: 0,
   stage: '片头',
   saveTimer: null,
   saveChain: Promise.resolve(),
   pollTimer: null,
   presentingAi: null,
-  uploadingRounds: new Set(),
-  surveyKind: 'pre',
-  surveyData: null,
   typing: {},
   lastReflectionLength: 0,
 });
@@ -114,7 +112,7 @@ function studentNavItems() {
 }
 
 function renderStudentNav() {
-  const active = state.view === 'survey' ? 'workspace' : state.view;
+  const active = state.view;
   $('#navigation').innerHTML = studentNavItems().map(([key, icon, label]) => `
     <button type="button" data-view="${key}" title="${label}" class="${active === key ? 'active' : ''}" ${active === key ? 'aria-current="page"' : ''}>
       ${icons(icon)}<span>${label}</span>
@@ -145,7 +143,6 @@ function renderStudent() {
   if (!state.me) { showStudentLogin(); return; }
   $('#roundBar').hidden = true;
   if (state.view === 'workspace') enterWorkspace();
-  else if (state.view === 'survey') renderSurvey();
   else if (state.view === 'records') renderRecords();
 }
 
@@ -158,17 +155,6 @@ async function enterWorkspace() {
     const overview = await api('/api/student/overview');
     if (state.view !== 'workspace' || request !== state.workspaceRequest) return;
     state.overview = overview;
-    const pre = overview.surveys.pre;
-    if (pre.enabled && !pre.submitted) {
-      renderRoundBar(state.roundId, null);
-      $('#main').innerHTML = `
-        <div class="notice task-notice">
-          <div class="row">${icons('info')}<span>进入反思工作台前，请先完成实验前问卷。</span></div>
-          <button class="btn small" type="button" id="startPreSurvey">填写前测问卷</button>
-        </div>`;
-      $('#startPreSurvey').addEventListener('click', () => openSurvey('pre'));
-      return;
-    }
     const available = overview.tasks.filter((task) => !task.locked);
     const selected = available.find((task) => task.round_id === state.roundId) || available[0];
     if (!selected) {
@@ -181,109 +167,6 @@ async function enterWorkspace() {
       $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
     }
   }
-}
-
-/* ------------------------------------------------------------ 问卷 */
-
-async function openSurvey(kind) {
-  $('#videoEl')?.pause();
-  stopPolling();
-  flushSave();
-  state.view = 'survey';
-  state.surveyKind = kind;
-  renderStudentNav();
-  $('#roundBar').hidden = true;
-  $('#main').innerHTML = '<div class="empty">加载问卷…</div>';
-  try {
-    const data = await api('/api/student/surveys');
-    if (state.view !== 'survey' || state.surveyKind !== kind) return;
-    state.surveyData = data;
-    renderSurvey();
-    window.scrollTo(0, 0);
-  } catch (ex) {
-    if (state.view !== 'survey' || state.surveyKind !== kind) return;
-    toast(ex.message);
-    state.view = 'workspace';
-    renderStudentNav();
-    renderStudent();
-  }
-}
-
-function renderSurvey() {
-  const data = state.surveyData;
-  if (!data) return;
-  const kind = state.surveyKind;
-  const meta = data[kind];
-  const items = data.items[kind];
-  const scale = data.scale;
-  const submitted = Boolean(meta.submitted);
-  const answers = meta.answers || {};
-  const title = kind === 'pre' ? '实验前问卷' : '实验后问卷';
-  const desc = kind === 'pre'
-    ? '请根据你目前的教学反思经验作答，答案没有对错。'
-    : '请根据本次任务的真实体验作答，答案没有对错。';
-  $('#main').innerHTML = `
-    <div class="page-head">
-      <div><div class="eyebrow">SURVEY</div><h1>${title}</h1><p>${desc}</p></div>
-      <button class="btn" type="button" id="backToWorkspace">返回工作台</button>
-    </div>
-    ${submitted ? `<div class="notice green" style="margin-bottom:16px">该问卷已于 ${fmtTime(meta.submitted_at)} 提交，不能重复填写。</div>` : ''}
-    <section class="card survey-card">
-      <form id="surveyForm">
-        ${items.map((item, idx) => `
-          <div class="survey-item">
-            <h3>${idx + 1}. ${esc(item.text)}</h3>
-            <div class="scale">
-              ${[1, 2, 3, 4, 5].map((v) => `
-                <label>
-                  <input type="radio" name="q-${item.id}" value="${v}" ${submitted ? 'disabled' : ''} ${Number(answers[item.id]) === v ? 'checked' : ''}>
-                  <span>${v}<small>${esc(scale[String(v)] || '')}</small></span>
-                </label>`).join('')}
-            </div>
-          </div>`).join('')}
-        ${kind === 'post' ? `
-          <div class="survey-item">
-            <h3>其他想法（选填）</h3>
-            <textarea class="survey-comment" id="surveyComment" maxlength="1000" ${submitted ? 'disabled' : ''} placeholder="可以写下你对本次任务或 AI 建议的其他看法。">${esc(answers.comment || '')}</textarea>
-          </div>` : ''}
-        ${submitted ? '' : `<div class="survey-actions">
-          <span class="small" id="surveyError" style="color:var(--red)"></span>
-          <button class="btn primary" type="submit">提交问卷</button>
-        </div>`}
-      </form>
-    </section>`;
-  $('#backToWorkspace').addEventListener('click', () => {
-    state.view = 'workspace';
-    renderStudentNav();
-    renderStudent();
-  });
-  const form = $('#surveyForm');
-  if (!form || submitted) return;
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const ans = {};
-    for (const item of items) {
-      const selected = form.querySelector(`input[name="q-${item.id}"]:checked`);
-      if (selected) ans[item.id] = Number(selected.value);
-    }
-    if (Object.keys(ans).length < items.length) {
-      $('#surveyError').textContent = '请完成所有题目后再提交';
-      return;
-    }
-    const comment = $('#surveyComment') ? $('#surveyComment').value.trim() : '';
-    const btn = form.querySelector('button[type="submit"]');
-    btn.disabled = true;
-    try {
-      await api(`/api/student/survey/${kind}`, { method: 'POST', body: { answers: ans, comment } });
-      toast('问卷已提交');
-      state.view = 'workspace';
-      renderStudentNav();
-      renderStudent();
-    } catch (ex) {
-      $('#surveyError').textContent = ex.message;
-      btn.disabled = false;
-    }
-  });
 }
 
 /* ------------------------------------------------------------ 工作台 */
@@ -311,16 +194,13 @@ async function openTask(roundId) {
     if (state.view !== 'workspace' || state.roundId !== roundId) return;
     toast(ex.message);
     state.task = null;
-    renderRoundBar(state.roundId, openTask);
+    renderRoundBar(state.roundId);
     $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
   }
 }
 
-function renderRoundBar(roundId, onChange, lockedRound = null) {
+function renderRoundBar(roundId, lockedRound = null) {
   const bar = $('#roundBar');
-  const post = state.overview?.surveys.post;
-  const offerPostSurvey = post?.enabled && !post.submitted
-    && (post.unlocked || state.overview.tasks.every((task) => task.status === 'submitted'));
   const task = state.task?.round_id === roundId ? state.task
     : state.overview?.tasks.find((entry) => entry.round_id === roundId);
   const className = state.me.class_name || '—';
@@ -334,22 +214,20 @@ function renderRoundBar(roundId, onChange, lockedRound = null) {
       <span>微课反思实验<span class="prototype-desc"> · 草稿与记录按轮次保存</span></span>
       <span class="prototype-separator" aria-hidden="true">│</span>
       <label for="currentRound">任务轮次</label>
-      <select id="currentRound" ${onChange ? '' : 'disabled'}>
+      <select id="currentRound">
         ${state.meta.rounds.map((round) => `<option value="${round.id}" ${round.id === roundId ? 'selected' : ''} ${round.id === lockedRound ? 'disabled' : ''}>第 ${round.id} 轮 · ${esc(round.name)}</option>`).join('')}
       </select>
       <label for="currentClass">当前班级</label>
       <select id="currentClass" disabled><option>${esc(classDetails)}</option></select>
     </div>
-    <button type="button" id="roundAction">${offerPostSurvey ? '填写后测问卷' : '任务说明'} ${icons('chevron', 'i-sm')}</button>`;
-  if (onChange) {
-    $('#currentRound').addEventListener('change', (event) => onChange(Number(event.target.value)));
-  }
-  $('#roundAction').addEventListener('click', offerPostSurvey ? () => openSurvey('post') : showTaskHelp);
+    <button type="button" id="roundAction">任务说明 ${icons('chevron', 'i-sm')}</button>`;
+  $('#currentRound').addEventListener('change', (event) => openTask(Number(event.target.value)));
+  $('#roundAction').addEventListener('click', showTaskHelp);
 }
 
 function showTaskHelp() {
   openStudentModal('任务说明', `
-    <p>从顶栏选择课堂练习或课后反思。每轮分别上传一段微课视频，并保存片头、片中和片尾的反思。</p>
+    <p>从顶栏选择课堂练习或课后反思。观看教师为本组设置的微课视频，并记录片头、片中和片尾的反思。</p>
     <p>确认最终稿后，本轮反思即锁定，可在「反思记录」查看已保存的内容。</p>`, [{ label: '关闭' }]);
 }
 
@@ -382,81 +260,49 @@ function renderWorkspace() {
 function renderWorkspaceRoundBar() {
   const task = state.task;
   const nextRoundLocked = task.round_id === 1 && task.fixed_sequence && task.status !== 'submitted';
-  renderRoundBar(task.round_id, openTask, nextRoundLocked ? 2 : null);
-}
-
-function exampleSlideHtml() {
-  return `
-    <div class="slide">
-      <div class="slide-left">
-        <div class="slide-kicker">小学数学 · 三年级上册</div>
-        <div class="slide-heading">分数的初步认识</div>
-        <div class="slide-desc">从生活出发，认识二分之一</div>
-        <div class="fraction-demo">
-          <div class="fraction-circle"></div><span class="fraction-eq">＝</span>
-          <div class="fraction-number"><span>1</span><span>2</span></div>
-          <div class="fraction-note">把一个整体平均分成两份<br>每份是它的二分之一</div>
-        </div>
-        <div class="chalk-line"></div>
-      </div>
-      <div class="camera"><div class="camera-bg"></div><div class="teacher-hair"></div><div class="teacher-face"></div><div class="teacher-body"></div><div class="teacher-shirt"></div></div>
-      <div class="demo-watermark">演示画面 · 非真实录像</div>
-      <div class="slide-page">认识分数 / 03</div>
-    </div>`;
+  renderRoundBar(task.round_id, nextRoundLocked ? 2 : null);
 }
 
 function videoCardHtml() {
   const task = state.task;
-  const submitted = task.status === 'submitted';
   const vs = task.video_status;
   const ready = vs === 'ready';
-  const disabled = ready ? '' : 'disabled';
   let stage;
   if (ready) {
-    const src = `/media/video/${task.id}?v=${encodeURIComponent(task.video_name || task.id)}`;
+    const src = `/media/video/${task.id}?v=${encodeURIComponent(task.video_version)}`;
     stage = `<video id="videoEl" src="${src}" preload="metadata" playsinline></video>
       <button class="play-big" type="button" id="bigPlay" aria-label="播放视频">${icons('play')}</button>`;
   } else if (vs === 'processing') {
-    stage = `<div class="video-placeholder">${icons('reset', 'i-lg spin')}<div>正在统一转码为 720p MP4，请稍候</div><div class="small">${task.flow === 'first' ? 'AI 建议呈现后可开始撰写反思' : '处理期间可以先撰写反思'}</div></div>`;
+    stage = `<div class="video-placeholder">${icons('reset', 'i-lg spin')}<div>小组视频正在处理，请稍候。</div></div>`;
   } else if (vs === 'failed') {
-    stage = `<div class="video-placeholder"><div class="big">!</div><div>视频处理失败</div>
-      <div class="small">反思草稿不受影响，可重试转码或重新上传</div>
-      ${task.can_retry_video ? '<button class="btn tiny" type="button" id="retryVideoBtn">重试转码</button>' : ''}</div>`;
+    stage = '<div class="video-placeholder">小组视频处理失败，请联系教师。</div>';
   } else {
-    stage = `${exampleSlideHtml()}
-      <button class="play-big" type="button" id="exampleUpload" aria-label="上传微课视频" ${submitted ? 'disabled' : ''}>${icons('play')}</button>`;
+    stage = '<div class="video-placeholder">请等待教师为本组设置视频。</div>';
   }
   return `
     <div class="panel-head">
-      <h2>${icons('video', 'i-sm')} 我的微课视频</h2>
+      <h2>${icons('video', 'i-sm')} 小组微课视频</h2>
       <span class="tag ${vs === 'ready' ? 'green' : vs === 'failed' ? 'red' : 'amber'}">${STUDENT_VIDEO_LABEL[vs]}</span>
     </div>
-    <div class="video-name"><span>${esc(task.video_name || '尚未上传微课视频')}</span><span>${ready ? 'MP4 · H.264' : '微课视频'}</span></div>
+    ${ready ? `<div class="video-name"><span>${esc(task.video_name)}</span><span>MP4 · H.264</span></div>` : ''}
     <div class="video-stage" id="videoStage">${stage}</div>
-    <div class="controls">
-      <input type="range" min="0" max="${task.duration || 0}" value="0" class="seek" id="seek" aria-label="视频进度" ${disabled}>
+    ${ready ? `<div class="controls">
+      <input type="range" min="0" max="${task.duration || 0}" value="0" class="seek" id="seek" aria-label="视频进度">
       <div class="row between">
         <div class="row player-time">
-          <button class="icon-btn" type="button" id="playButton" aria-label="播放视频" ${disabled}>${icons('play', 'i-sm')}</button>
+          <button class="icon-btn" type="button" id="playButton" aria-label="播放视频">${icons('play', 'i-sm')}</button>
           <div class="time" id="timeDisplay">00:00 <span>/ ${fmtDur(task.duration)}</span></div>
         </div>
         <div class="row player-options">
-          <button class="icon-btn" type="button" id="volumeButton" aria-label="静音" aria-pressed="false" ${disabled}>${icons('volume', 'i-sm')}</button>
-          <select class="player-select" id="playSpeed" aria-label="播放速度" ${disabled}>
+          <button class="icon-btn" type="button" id="volumeButton" aria-label="静音" aria-pressed="false">${icons('volume', 'i-sm')}</button>
+          <select class="player-select" id="playSpeed" aria-label="播放速度">
             <option value="1">1.0×</option><option value="1.25">1.25×</option>
             <option value="1.5">1.5×</option><option value="2">2.0×</option>
           </select>
-          <button class="icon-btn" type="button" id="fullscreenButton" aria-label="全屏播放" ${disabled}>${icons('expand', 'i-sm')}</button>
+          <button class="icon-btn" type="button" id="fullscreenButton" aria-label="全屏播放">${icons('expand', 'i-sm')}</button>
         </div>
       </div>
-    </div>
-    <div class="video-footer">
-      <button class="btn ghost tiny" type="button" id="uploadBtn" ${submitted || vs === 'processing' || state.uploadingRounds.has(task.round_id) ? 'disabled' : ''}>
-        ${icons('upload', 'i-sm')} 上传 / 更换视频
-      </button>
-      <small id="videoMeta">${submitted ? '本轮已提交，视频锁定' : vs === 'empty' ? '当前为示例画面 · 请上传你的微课视频' : '支持 mp4 / mov / webm 等格式，500MB 以内'}</small>
-    </div>
-    <div id="uploadProgress"></div>`;
+    </div>` : ''}`;
 }
 
 function aiCardHtml() {
@@ -471,7 +317,7 @@ function aiCardHtml() {
   } else if (ai.status === 'waiting') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('clock')}</div>
       <h3>视频就绪后，AI 将先提供观察与建议</h3>
-      <p>请上传微课视频。AI 建议呈现后即可开始撰写反思。</p></div>`;
+      <p>AI 建议呈现后即可开始撰写反思。</p></div>`;
   } else if (ai.status === 'generating') {
     body = `<div class="ai-lock"><div class="lock-visual">${icons('reset', 'spin')}</div>
       <h3>正在生成视频观察与建议</h3>
@@ -509,7 +355,7 @@ function scaffoldHtml() {
   return `
     <div class="scaffold">
       <div class="scaffold-title">
-        <span>${task.scaffold ? '按视频阶段，回看你的课堂' : '选择反思阶段'}</span>
+        <span>${task.scaffold ? '按视频阶段回看本组视频' : '选择反思阶段'}</span>
         <small>各阶段内容分别保存</small>
       </div>
       <div class="prompts">
@@ -593,7 +439,7 @@ function primaryDisabled() {
 function submitHint() {
   const task = state.task;
   if (task.status === 'submitted') return '本轮任务已提交';
-  if (task.video_status !== 'ready') return '请等待标准视频就绪';
+  if (task.video_status !== 'ready') return '请等待小组视频就绪';
   if (awaitingFirstFeedback(task)) return '请等待 AI 建议首次呈现';
   if (!STAGES.some((stage) => task.stages[stage]?.trim())) return '请先填写反思正文';
   if (task.flow === 'later') return '提交后保存最终稿并生成一条改进建议';
@@ -601,34 +447,6 @@ function submitHint() {
 }
 
 function bindVideo() {
-  const uploadBtn = $('#uploadBtn');
-  if (uploadBtn) {
-    uploadBtn.addEventListener('click', () => {
-      openStudentModal('准备你的微课视频', `
-        <p>上传后统一处理为标准视频，供回看片段和插入时间点。${state.task.flow === 'first' ? 'AI 建议呈现后可开始撰写反思。' : '处理期间你可以编辑反思。'}</p>
-        <div class="upload-zone">
-          ${icons('upload')}
-          <button class="btn" id="chooseVideoBtn" type="button">选择本地视频</button>
-          <p>支持 mp4 / mov / webm 等格式，500MB 以内</p>
-        </div>`, [{ label: '返回工作台' }]);
-      $('#chooseVideoBtn').addEventListener('click', () => {
-        const input = $('#fileInput');
-        input.value = '';
-        input.click();
-      });
-    });
-    $('#exampleUpload')?.addEventListener('click', () => uploadBtn.click());
-  }
-  const retry = $('#retryVideoBtn');
-  if (retry) {
-    retry.addEventListener('click', async () => {
-      try {
-        await api(`/api/student/task/${state.roundId}/video/retry`, { method: 'POST' });
-        toast('已重新开始转码');
-        await refreshTask(true);
-      } catch (ex) { toast(ex.message); }
-    });
-  }
   const video = $('#videoEl');
   if (!video) return;
   const stage = $('#videoStage');
@@ -803,6 +621,7 @@ async function saveReflection(text) {
 }
 
 function flushSave() {
+  flushTyping();
   if (state.saveTimer) {
     clearTimeout(state.saveTimer);
     state.saveTimer = null;
@@ -814,7 +633,6 @@ function flushSave() {
 
 function switchStage(stage) {
   if (stage === state.stage) return;
-  flushTyping(state.stage);
   flushSave();
   state.stage = stage;
   $$('[data-stage]').forEach((btn) => {
@@ -834,7 +652,6 @@ function switchStage(stage) {
 async function saveDraft(manual) {
   const task = state.task;
   const stage = state.stage;
-  flushTyping(stage);
   flushSave();
   try {
     await state.saveChain;
@@ -966,10 +783,10 @@ function updateWorkspaceFeedback(task) {
 async function primaryAction() {
   const task = state.task;
   if (task.status === 'submitted') { showFinalSnapshot(task); return; }
-  flushTyping(state.stage);
   flushSave();
   await state.saveChain.catch(() => {});
   if (state.view !== 'workspace' || state.task !== task || primaryDisabled()) return;
+  const videoVersion = task.video_version;
   const message = task.flow === 'later'
     ? '提交后将保存最终稿并结束本轮任务，随后根据正文生成一条改进建议。'
     : '提交后将保存最终稿并结束本轮任务。';
@@ -982,7 +799,9 @@ async function primaryAction() {
       {
         label: '确认提交', primary: true, onClick: async () => {
           try {
-            await api(`/api/student/task/${task.round_id}/submit`, { method: 'POST' });
+            await api(`/api/student/task/${task.round_id}/submit`, {
+              method: 'POST', body: { video_version: videoVersion },
+            });
             await refreshTask();
             if (state.view !== 'workspace' || state.task !== task) return;
             setTimeout(() => showSubmissionSuccess(task), 0);
@@ -994,23 +813,24 @@ async function primaryAction() {
 
 /* ------------------------------------------------------------ 刷新与轮询 */
 
-async function refreshTask(reloadVideo = false) {
+async function refreshTask() {
   const previous = state.task;
   if (state.view !== 'workspace' || !previous) return;
+  const refresh = ++state.taskRefresh;
   try {
     const task = await api(`/api/student/task/${previous.round_id}`);
-    if (state.view !== 'workspace' || state.task !== previous) return;
+    if (state.view !== 'workspace' || state.task !== previous || refresh !== state.taskRefresh) return;
     const statusChanged = previous.status !== task.status;
     const feedbackChanged = previous.final_feedback?.status !== task.final_feedback?.status;
-    const videoChanged = reloadVideo || previous.video_status !== task.video_status
-      || previous.video_name !== task.video_name;
+    const videoChanged = previous.video_status !== task.video_status
+      || previous.video_version !== task.video_version;
     const aiChanged = previous.ai.status !== task.ai.status || videoChanged;
     if (task.status !== 'submitted') {
       task.stages = previous.stages;
       task.stage_meta = previous.stage_meta;
       task.order_deviation ||= previous.order_deviation;
     }
-    if (task.ai.status === 'ready') task.ai.presented_at ||= previous.ai.presented_at;
+    if (task.ai.status === 'ready' && !videoChanged) task.ai.presented_at ||= previous.ai.presented_at;
     Object.assign(previous, task);
     if (videoChanged) {
       $('#videoEl')?.pause();
@@ -1026,8 +846,6 @@ async function refreshTask(reloadVideo = false) {
       if (overviewTask) overviewTask.status = task.status;
       $('#reflectionCard').innerHTML = reflectionCardHtml();
       bindReflection();
-      $('#uploadBtn').disabled = task.status === 'submitted';
-      $('#videoMeta').textContent = '本轮已提交，视频锁定';
       renderWorkspaceRoundBar();
     }
     if (statusChanged || feedbackChanged) updateWorkspaceFeedback(previous);
@@ -1036,7 +854,9 @@ async function refreshTask(reloadVideo = false) {
     markAiPresented();
   } catch (ex) { /* 轮询期间忽略短暂错误 */ }
   finally {
-    if (state.view === 'workspace' && state.task === previous) schedulePollIfNeeded();
+    if (state.view === 'workspace' && state.task === previous && refresh === state.taskRefresh) {
+      schedulePollIfNeeded();
+    }
   }
 }
 
@@ -1044,18 +864,18 @@ function schedulePollIfNeeded() {
   stopPolling();
   const task = state.task;
   if (!task) return;
-  const need = task.video_status === 'processing' || task.ai.status === 'generating'
+  const processing = task.video_status === 'processing' || task.ai.status === 'generating'
     || (task.flow === 'first' && task.status !== 'submitted' && task.video_status === 'ready'
       && (task.ai.status === 'waiting' || (task.ai.status === 'ready' && !task.ai.presented_at)))
     || task.final_feedback?.status === 'generating';
-  if (!need) return;
+  if (!processing && task.status === 'submitted') return;
   state.pollTimer = setTimeout(async () => {
     const prevAi = task.ai.status;
     await refreshTask();
     if (state.task === task && prevAi !== 'ready' && task.ai.status === 'ready') {
       toast('AI 观察与建议已生成');
     }
-  }, 1800);
+  }, processing ? 1800 : 5000);
 }
 
 function stopPolling() {
@@ -1067,9 +887,13 @@ async function markAiPresented() {
   const task = state.task;
   if (!task || task.flow !== 'first' || !$('#feedbackBody') || task.ai.status !== 'ready'
     || task.ai.presented_at || state.presentingAi === task) return;
+  const videoVersion = task.video_version;
   state.presentingAi = task;
   try {
-    const result = await api(`/api/student/task/${task.round_id}/ai/present`, { method: 'POST' });
+    const result = await api(`/api/student/task/${task.round_id}/ai/present`, {
+      method: 'POST', body: { video_version: videoVersion },
+    });
+    if (task.video_version !== videoVersion) return;
     task.ai.presented_at = result.presented_at;
     if (state.view === 'workspace' && state.task === task) updateReflectionState(task);
   } catch (ex) { /* 忽略 */ }
@@ -1083,65 +907,6 @@ function logEvent(type, detail = '', position = null, roundId = state.task?.roun
   api(`/api/student/task/${roundId}/event`, {
     method: 'POST', body: { type, detail, position },
   }).catch(() => {});
-}
-
-/* ------------------------------------------------------------ 视频上传 */
-
-function bindFileInput() {
-  $('#fileInput').addEventListener('change', (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file || state.view !== 'workspace' || !state.task || state.uploadingRounds.has(state.roundId)) return;
-    if (file.size === 0) { toast('所选文件为空，请重新选择视频'); return; }
-    if (file.size > 500 * 1024 * 1024) { toast('文件超过 500MB'); return; }
-    closeModal();
-    uploadVideo(file);
-  });
-}
-
-function uploadVideo(file) {
-  const roundId = state.roundId;
-  state.uploadingRounds.add(roundId);
-  $('#uploadBtn').disabled = true;
-  const form = new FormData();
-  form.append('video', file);
-  const wrap = $('#uploadProgress');
-  if (wrap) {
-    wrap.className = 'video-progress';
-    wrap.innerHTML = `<div class="progress"><div style="width:0%"></div></div><div class="small">正在上传 ${esc(file.name)}</div>`;
-  }
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', `/api/student/task/${roundId}/video`);
-  const finishUpload = () => {
-    state.uploadingRounds.delete(roundId);
-    if (state.view === 'workspace' && state.task?.round_id === roundId) {
-      $('#uploadBtn').disabled = state.task.status === 'submitted' || state.task.video_status === 'processing';
-    }
-    if (wrap) wrap.innerHTML = '';
-  };
-  xhr.upload.onprogress = (ev) => {
-    if (!ev.lengthComputable) return;
-    const pct = Math.min(100, Math.round((ev.loaded / ev.total) * 100));
-    const bar = wrap && wrap.querySelector('.progress>div');
-    if (bar) bar.style.width = `${pct}%`;
-    const hint = wrap && wrap.querySelector('.small');
-    if (hint) hint.textContent = `正在上传 ${file.name} · ${pct}%`;
-  };
-  xhr.onload = async () => {
-    let data = null;
-    try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
-    finishUpload();
-    if (xhr.status < 200 || xhr.status >= 300) {
-      toast((data && data.error) || '上传失败');
-      return;
-    }
-    toast('上传完成，正在统一转码');
-    if (state.task?.round_id === roundId) await refreshTask(true);
-  };
-  xhr.onerror = () => {
-    finishUpload();
-    toast('网络中断，上传失败');
-  };
-  xhr.send(form);
 }
 
 /* ------------------------------------------------------------ 反思记录 */
@@ -1257,7 +1022,6 @@ function openStudentMobileNav() {
 }
 
 async function bootStudent() {
-  bindFileInput();
   $('#studentRole').addEventListener('click', () => goStudentView('workspace'));
   $('#researchRole').addEventListener('click', switchToResearch);
   $('#studentProfile').addEventListener('click', openStudentAccount);

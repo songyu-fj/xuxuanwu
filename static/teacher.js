@@ -1,14 +1,16 @@
 'use strict';
 
-const TEACHER_PAGE_TITLES = { config: '实验配置', data: '过程数据' };
+const TEACHER_PAGE_TITLES = { config: '实验配置', videos: '小组视频', data: '过程数据' };
 
 Object.assign(state, {
   view: 'config',
   dataTab: 'tasks',
   filters: { class_id: '', round_id: '' },
   anonymous: false,
-  surveyMeta: null,
   taskStats: [],
+  videoPoll: null,
+  videoRefresh: 0,
+  videoOperations: new Map(),
 });
 
 /* ------------------------------------------------------------ 登录 */
@@ -80,7 +82,7 @@ function showTeacherApp() {
 }
 
 function teacherNavItems() {
-  return [['config', 'settings', '实验配置'], ['data', 'chart', '过程数据']];
+  return [['config', 'settings', '实验配置'], ['videos', 'video', '小组视频'], ['data', 'chart', '过程数据']];
 }
 
 function renderTeacherNav() {
@@ -108,8 +110,10 @@ function goTeacherView(view) {
 }
 
 function renderTeacher() {
+  clearTimeout(state.videoPoll);
   if (!state.me) { showTeacherLogin(); return; }
   if (state.view === 'data') renderData();
+  else if (state.view === 'videos') renderTeacherVideos();
   else renderConfig();
 }
 
@@ -119,6 +123,7 @@ async function renderConfig() {
   $('#main').innerHTML = '<div class="empty">加载中…</div>';
   try {
     const data = await api('/api/teacher/config');
+    if (state.view !== 'config') return;
     const roundsHtml = data.rounds.map((round) => `
       <section class="round-config">
         <div class="section-heading">
@@ -157,7 +162,7 @@ async function renderConfig() {
       ${roundsHtml}`;
     $('#saveConfigBtn').addEventListener('click', saveConfig);
   } catch (ex) {
-    $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
+    if (state.view === 'config') $('#main').innerHTML = `<div class="empty">${esc(ex.message)}</div>`;
   }
 }
 
@@ -176,6 +181,153 @@ async function saveConfig() {
   }
 }
 
+/* ------------------------------------------------------------ 小组视频 */
+
+function renderTeacherVideos() {
+  $('#main').innerHTML = `
+    <div class="page-head">
+      <div>
+        <h1>小组视频</h1>
+        <p>每组选一个视频，课堂练习和课后反思共用。支持 MP4、MOV、WebM 等格式，500 MB 以内。</p>
+      </div>
+    </div>
+    <div class="group-video-grid" id="teacherVideoList"><div class="empty">加载中…</div></div>`;
+  const list = $('#teacherVideoList');
+  list.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-video-action]');
+    if (!button) return;
+    const card = button.closest('[data-class-video]');
+    if (button.dataset.videoAction === 'upload') card.querySelector('input[type="file"]').click();
+    else updateTeacherVideo(Number(card.dataset.classVideo));
+  });
+  list.addEventListener('change', (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    event.target.value = '';
+    updateTeacherVideo(Number(event.target.closest('[data-class-video]').dataset.classVideo), file);
+  });
+  refreshTeacherVideos(list);
+}
+
+function teacherVideoCardHtml(group) {
+  const id = group.class_id;
+  const status = group.status;
+  const progress = state.videoOperations.get(id) || '';
+  const disabled = status === 'processing' || progress ? 'disabled' : '';
+  const preview = group.video_version
+    ? `<video controls preload="metadata" playsinline src="/media/class-video/${id}?v=${encodeURIComponent(group.video_version)}"></video>`
+    : '<div class="group-video-placeholder">暂无可播放的视频</div>';
+  let detail = '';
+  if (status === 'processing') detail = `正在处理 ${group.upload_name}。`;
+  if (status === 'failed') detail = `${group.upload_name} 处理失败，请重试或重新上传。`;
+  if (group.video_name && detail) detail += ' 小组暂时继续使用当前视频。';
+  return `
+    <header class="row between">
+      <h2>${esc(group.class_name)}</h2>
+      <span class="tag ${status === 'ready' ? 'green' : status === 'failed' ? 'red' : 'amber'}">${VIDEO_LABEL[status]}</span>
+    </header>
+    ${preview}
+    ${group.video_name ? `<p class="group-video-name">${esc(group.video_name)} · ${fmtDur(group.duration)}</p>` : ''}
+    ${detail ? `<p class="group-video-detail" role="status">${esc(detail)}</p>` : ''}
+    <div class="row group-video-actions">
+      <button class="btn ${group.video_name ? 'ghost' : 'primary'} tiny" type="button" data-video-action="upload" ${disabled}>
+        ${icons('upload', 'i-sm')} ${group.video_name ? '更换视频' : '上传视频'}
+      </button>
+      ${group.can_retry ? `<button class="btn ghost tiny" type="button" data-video-action="retry" ${disabled}>重试处理</button>` : ''}
+      <input type="file" accept=".mp4,.mov,.m4v,.webm,.mkv,.avi,.wmv,.flv" aria-label="${esc(group.class_name)}视频" hidden>
+    </div>
+    <p class="group-video-detail" data-video-progress role="status" ${progress ? '' : 'hidden'}>${esc(progress)}</p>`;
+}
+
+async function refreshTeacherVideos(list) {
+  if (!list) return;
+  clearTimeout(state.videoPoll);
+  const refresh = ++state.videoRefresh;
+  try {
+    const { groups } = await api('/api/teacher/videos');
+    if (!list.isConnected || refresh !== state.videoRefresh) return;
+    list.querySelector('.empty')?.remove();
+    for (const group of groups) {
+      let card = list.querySelector(`[data-class-video="${group.class_id}"]`);
+      if (!card) {
+        card = document.createElement('section');
+        card.className = 'card group-video-card';
+        card.dataset.classVideo = group.class_id;
+        list.append(card);
+      }
+      const version = JSON.stringify(group);
+      if (card.dataset.version === version) continue;
+      card.dataset.version = version;
+      card.dataset.status = group.status;
+      const player = card.querySelector('video');
+      card.innerHTML = teacherVideoCardHtml(group);
+      const newPlayer = card.querySelector('video');
+      if (player && newPlayer && player.src === newPlayer.src) newPlayer.replaceWith(player);
+    }
+  } catch (ex) {
+    if (!list.isConnected || refresh !== state.videoRefresh) return;
+    const placeholder = list.querySelector('.empty');
+    if (placeholder) placeholder.textContent = ex.message;
+  } finally {
+    if (list.isConnected && refresh === state.videoRefresh && list.querySelector('[data-status="processing"]')) {
+      state.videoPoll = setTimeout(() => refreshTeacherVideos(list), 1800);
+    }
+  }
+}
+
+function showTeacherVideoProgress(classId, message) {
+  if (message) state.videoOperations.set(classId, message);
+  else state.videoOperations.delete(classId);
+  const card = $(`#teacherVideoList [data-class-video="${classId}"]`);
+  if (!card) return;
+  const progress = card.querySelector('[data-video-progress]');
+  progress.textContent = message;
+  progress.hidden = !message;
+  card.querySelectorAll('[data-video-action]').forEach((button) => {
+    button.disabled = Boolean(message) || card.dataset.status === 'processing';
+  });
+}
+
+function uploadTeacherVideo(path, classId, file) {
+  const form = new FormData();
+  form.append('video', file);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path);
+    xhr.responseType = 'json';
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.round(100 * event.loaded / event.total);
+      showTeacherVideoProgress(classId, `正在上传 ${file.name} · ${percent}%`);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error(xhr.response?.error || '上传失败'));
+    };
+    xhr.onerror = () => reject(new Error('网络中断，上传失败'));
+    xhr.send(form);
+  });
+}
+
+async function updateTeacherVideo(classId, file) {
+  if (state.videoOperations.has(classId)) return;
+  if (file && (!file.size || file.size > 500 * 1024 * 1024)) {
+    toast(file.size ? '文件超过 500 MB' : '所选文件为空，请重新选择视频');
+    return;
+  }
+  const path = `/api/teacher/classes/${classId}/video`;
+  showTeacherVideoProgress(classId, file ? `正在上传 ${file.name}` : '正在请求重新处理');
+  try {
+    if (file) await uploadTeacherVideo(path, classId, file);
+    else await api(`${path}/retry`, { method: 'POST' });
+  } catch (ex) {
+    toast(ex.message);
+  } finally {
+    showTeacherVideoProgress(classId, '');
+    await refreshTeacherVideos($('#teacherVideoList'));
+  }
+}
+
 /* ------------------------------------------------------------ 过程数据 */
 
 function renderData() {
@@ -184,12 +336,11 @@ function renderData() {
       <div>
         <div class="eyebrow">RESEARCH DATA</div>
         <h1>过程数据</h1>
-        <p>按班级和任务查看提交情况、文本版本、AI 反馈、行为事件与问卷。</p>
+        <p>按班级和任务查看提交情况、文本版本、AI 反馈与行为事件。</p>
       </div>
       <div class="export-row">
         <label class="anon-label"><input type="checkbox" id="anonExport" ${state.anonymous ? 'checked' : ''}> 匿名导出</label>
         <a class="btn" id="participantsLink" href="#">参与者名单</a>
-        <a class="btn" id="surveysLink" href="#">问卷 CSV</a>
         <button class="btn primary" type="button" id="exportDataBtn">${icons('download', 'i-sm')} 导出研究数据</button>
       </div>
     </div>
@@ -207,7 +358,7 @@ function renderData() {
       <button class="btn small" type="button" id="refreshData">刷新</button>
     </div>
     <div class="tabs">
-      ${[['tasks', '任务记录'], ['versions', '文本版本'], ['feedback', 'AI 反馈'], ['events', '行为事件'], ['surveys', '问卷']]
+      ${[['tasks', '任务记录'], ['versions', '文本版本'], ['feedback', 'AI 反馈'], ['events', '行为事件']]
         .map(([k, label]) => `<button type="button" data-tab="${k}" class="${state.dataTab === k ? 'active' : ''}">${label}</button>`).join('')}
     </div>
     <div id="dataContent"><div class="empty">加载中…</div></div>`;
@@ -244,8 +395,6 @@ function exportHref(type, includeRound = true, localNames = false) {
 }
 
 function updateExportLinks() {
-  const surveysLink = $('#surveysLink');
-  if (surveysLink) surveysLink.href = exportHref('surveys', false);
   const participantsLink = $('#participantsLink');
   if (participantsLink) participantsLink.href = exportHref('participants', false);
 }
@@ -293,9 +442,6 @@ async function loadData() {
     if (state.dataTab !== 'tasks') {
       const data = await api(`/api/teacher/monitor/${state.dataTab}${qs ? `?${qs}` : ''}`);
       rows = data.rows || [];
-      state.surveyMeta = data.items ? { items: data.items, scale: data.scale } : null;
-    } else {
-      state.surveyMeta = null;
     }
     renderStats();
     box.innerHTML = renderDataTable(state.dataTab, rows);
@@ -379,31 +525,6 @@ function renderDataTable(tab, rows) {
         <td>${fmtTime(r.presented_at)}</td>
         <td class="wrap-cell">${r.items.length ? `<details><summary>查看反馈</summary><pre>${esc(r.items.map((i) => `[${i.stage}] ${i.title}\n${i.observation}\n建议：${i.suggestion}`).join('\n\n'))}</pre></details>` : '—'}</td>
         <td><a href="/api/teacher/task/${r.task_id}/ai" download>下载</a></td>
-      </tr>`).join('')}</tbody>
-    </table></div>`;
-  }
-  if (tab === 'surveys') {
-    const meta = state.surveyMeta || { items: {}, scale: {} };
-    const block = (obj, kind) => {
-      if (!obj) return '';
-      const answers = obj.answers || {};
-      const lines = (meta.items[kind] || []).map((item) => {
-        const score = answers[item.id];
-        return `${item.text}\n  ${score ?? '—'} · ${meta.scale[String(score)] || ''}`;
-      }).join('\n');
-      const comment = answers.comment ? `\n其他想法：${answers.comment}` : '';
-      return `<details><summary>${kind === 'pre' ? '前测答卷' : '后测答卷'}</summary><pre>${esc(lines + comment)}</pre></details>`;
-    };
-    return `<div class="card table-card"><table class="table">
-      <thead><tr><th>编号</th><th>学生</th><th>学号</th><th>班级</th><th>前测</th><th>后测</th><th>答卷</th></tr></thead>
-      <tbody>${rows.map((r) => `<tr>
-        <td><strong>${esc(r.participant_id || '—')}</strong></td>
-        <td>${esc(r.student_name)}</td>
-        <td>${esc(r.student_no)}</td>
-        <td>${esc(r.class_name)}</td>
-        <td>${r.pre ? `<span class="tag green">已填写</span><br><span class="muted">${fmtTime(r.pre.submitted_at)}</span>` : '<span class="tag">未填写</span>'}</td>
-        <td>${r.post ? `<span class="tag green">已填写</span><br><span class="muted">${fmtTime(r.post.submitted_at)}</span>` : '<span class="tag">未填写</span>'}</td>
-        <td class="wrap-cell">${r.pre || r.post ? `${block(r.pre, 'pre')}${block(r.post, 'post')}` : '—'}</td>
       </tr>`).join('')}</tbody>
     </table></div>`;
   }
